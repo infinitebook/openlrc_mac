@@ -7,7 +7,7 @@ import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from faster_whisper.transcribe import Segment, Word
+from openlrc.whisper_types import Segment, Word
 
 from openlrc.openlrc import LRCer, TranscriptionConfig, TranslationConfig
 from openlrc.transcribe import TranscriptionInfo
@@ -17,7 +17,6 @@ from openlrc.utils import extend_filename
 _TEST_TRANSCRIPTION = TranscriptionConfig(whisper_model="tiny", compute_type="default", device="cpu")
 
 
-@patch("openlrc.transcribe.BatchedInferencePipeline", MagicMock())
 @patch(
     "openlrc.transcribe.Transcriber.transcribe",
     MagicMock(

@@ -16,7 +16,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from faster_whisper.transcribe import Segment
+    from openlrc.whisper_types import Segment
 
 from openlrc.config import TranscriptionConfig, TranslationConfig
 from openlrc.defaults import default_asr_options, default_preprocess_options, default_vad_options
@@ -176,10 +176,9 @@ class LRCer:
                 if self._transcriber is None:
                     self._transcriber = Transcriber(
                         model_name=self._transcription_config.whisper_model,
-                        compute_type=self._transcription_config.compute_type,
-                        device=self._transcription_config.device,
+                        cli_path=self._transcription_config.cli_path,
+                        vad_model=self._transcription_config.vad_model,
                         asr_options=self.asr_options,
-                        vad_options=self.vad_options,
                     )
         return self._transcriber
 

@@ -43,6 +43,16 @@ default_vad_options = {
 
 default_preprocess_options = {"atten_lim_db": 15}
 
+# whisper.cpp CLI 可用参数映射（仅保留与原 faster-whisper 语义可对齐的子集）
+# 完整参数列表请参见 whisper.cpp/examples/cli/README.md
+default_whisper_cpp_options = {
+    "beam_size": 5,
+    "best_of": 5,
+    "temperature": 0.0,
+    "initial_prompt": None,
+    "suppress_nst": False,  # -sns: suppress non-speech tokens
+}
+
 # Currently bottleneck-ed by Spacy
 supported_languages = {
     "ca",

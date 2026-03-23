@@ -5,13 +5,14 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pysbd
-from faster_whisper.transcribe import BatchedInferencePipeline, Segment, WhisperModel
 from pysbd.languages import LANGUAGE_CODES
 from tqdm import tqdm
 
-from openlrc.defaults import default_asr_options, default_vad_options
+from openlrc.defaults import default_whisper_cpp_options
 from openlrc.logger import logger
 from openlrc.utils import Timer, format_timestamp, get_audio_duration, spacy_load
+from openlrc.whisper_backend import WhisperCLIBackend
+from openlrc.whisper_types import Segment, Word
 
 
 class TranscriptionInfo(NamedTuple):
@@ -39,48 +40,171 @@ class TranscriptionInfo(NamedTuple):
         return 1 - self.duration_after_vad / self.duration
 
 
+def _parse_timestamp_str(ts: str) -> float:
+    """解析 whisper.cpp 时间戳字符串为秒数。
+
+    whisper.cpp JSON 的 timestamps.from/to 格式为 "HH:MM:SS.mmm" 或 "HH:MM:SS,mmm"
+    (源码 cli.cpp L687: to_timestamp(t0, true) 输出 SRT 格式)
+
+    Args:
+        ts: 时间戳字符串，例如 "00:00:01.500" 或 "00:00:01,500"。
+
+    Returns:
+        浮点秒数。
+    """
+    ts = ts.replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    elif len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + float(s)
+    else:
+        return float(ts)
+
+
+def map_cli_json_to_segments(cli_json: dict) -> list[Segment]:
+    """将 whisper-cli -ojf 输出的 JSON 转换为 Segment 列表。
+
+    JSON 结构（-ojf 模式，源码验证于 cli.cpp L725-L765）::
+
+        {
+          "result": {"language": "en"},
+          "transcription": [
+            {
+              "timestamps": {"from": "00:00:00,000", "to": "00:00:03,000"},
+              "offsets": {"from": 0, "to": 3000},
+              "text": "hello world",
+              "tokens": [
+                {
+                  "text": "hello",
+                  "timestamps": {"from": "00:00:00,000", "to": "00:00:01,500"},
+                  "offsets": {"from": 0, "to": 1500},
+                  "id": 123, "p": 0.95, "t_dtw": -1.0
+                }, ...
+              ]
+            }, ...
+          ]
+        }
+
+    时间单位说明:
+      offsets 值为毫秒。源码 cli.cpp L691: ``value_i("from", t0 * 10, ...)``
+      其中 t0 是 centiseconds（10ms 精度），乘以 10 得到 milliseconds。
+      因此转换公式: ``seconds = offsets["from"] / 1000.0``
+
+    Args:
+        cli_json: whisper-cli 的 JSON 输出 dict。
+
+    Returns:
+        Segment 列表，每个 Segment 包含带 Word 级时间戳的 words 列表。
+    """
+    segments: list[Segment] = []
+
+    for i, seg in enumerate(cli_json.get("transcription", [])):
+        # --- Segment 级时间 ---
+        seg_start = seg["offsets"]["from"] / 1000.0
+        seg_end = seg["offsets"]["to"] / 1000.0
+        seg_text = seg.get("text", "").strip()
+
+        # --- Token/Word 级时间 ---
+        words: list[Word] = []
+        for tok in seg.get("tokens", []):
+            tok_text = tok.get("text", "")
+
+            # 跳过特殊 token（如 [SOT], [EOT], [_BEG_] 等）
+            if tok_text.startswith("[") and tok_text.endswith("]"):
+                continue
+            # 跳过纯空白 token
+            if not tok_text.strip():
+                continue
+
+            # 优先用 offsets（精确整数毫秒），回退用 timestamps（字符串）
+            if "offsets" in tok:
+                w_start = tok["offsets"]["from"] / 1000.0
+                w_end = tok["offsets"]["to"] / 1000.0
+            elif "timestamps" in tok:
+                w_start = _parse_timestamp_str(tok["timestamps"]["from"])
+                w_end = _parse_timestamp_str(tok["timestamps"]["to"])
+            else:
+                # 无时间戳的 token，使用 segment 级时间作为 fallback
+                w_start = seg_start
+                w_end = seg_end
+
+            probability = tok.get("p", 0.0)
+            words.append(
+                Word(
+                    start=w_start,
+                    end=w_end,
+                    word=tok_text,
+                    probability=probability,
+                )
+            )
+
+        # 过滤空 words 的 segment
+        # sentence_split() 中有 assert segment.words is not None
+        if not words:
+            logger.warning(f"Segment {i} has no valid words, skipping: '{seg_text}'")
+            continue
+
+        segments.append(
+            Segment(
+                id=i,
+                seek=0,
+                start=seg_start,
+                end=seg_end,
+                text=seg_text,
+                tokens=[],  # OpenLRC 下游不使用 raw token IDs
+                avg_logprob=0.0,
+                compression_ratio=0.0,
+                no_speech_prob=0.0,
+                words=words,
+                temperature=0.0,
+            )
+        )
+
+    return segments
+
+
 class Transcriber:
     """
-    A class for transcribing audio files using the Whisper model.
+    A class for transcribing audio files using whisper-cli.
+
+    This replaces the previous faster-whisper-based Transcriber with a
+    subprocess-based whisper.cpp CLI backend that supports Metal acceleration.
 
     Attributes:
-        model_name (str): The name of the Whisper model to use.
-        compute_type (str): The compute type for the model (e.g., 'float16').
-        device (str): The device to run the model on (e.g., 'cuda').
+        model_name (str): Path to the Whisper GGML model file.
+        cli_backend (WhisperCLIBackend): The CLI backend instance.
         continuous_scripted (list): List of languages that are continuously scripted.
         asr_options (dict): Options for the ASR model.
-        vad_options (dict): Options for Voice Activity Detection.
-        whisper_model (BatchedInferencePipeline): The Whisper model pipeline.
     """
 
     def __init__(
         self,
-        model_name: str = "large-v3",
-        compute_type: str = "float16",
-        device: str = "cuda",
-        vad_filter: bool = True,
+        model_name: str = "ggml-large-v3-turbo.bin",
+        cli_path: str = "whisper-cli",
+        vad_model: str = "",
         asr_options: dict | None = None,
+        # 以下参数保留签名兼容性但不再使用
+        compute_type: str = "float16",
+        device: str = "auto",
+        vad_filter: bool = True,
         vad_options: dict | None = None,
     ):
         self.model_name = model_name
-        self.compute_type = compute_type
-        self.device = device
-        # self.no_need_align = ['en', 'ja', 'zh']  # Languages that is accurate enough without sentence alignment
         self.continuous_scripted = ["ja", "zh", "zh-cn", "th", "vi", "lo", "km", "my", "bo"]
-        self.asr_options = asr_options or default_asr_options
-        self.vad_options = vad_options or default_vad_options
-        self.use_vad_model = vad_filter
+        self.asr_options = {**default_whisper_cpp_options, **(asr_options or {})}
 
-        model = WhisperModel(model_name, device, compute_type=compute_type, num_workers=1)
-        if self.asr_options["batch_size"] == 1:
-            self.whisper_model = model
-            del self.asr_options["batch_size"]
-        else:
-            self.whisper_model = BatchedInferencePipeline(model)
+        self.cli_backend = WhisperCLIBackend(
+            cli_path=cli_path,
+            model_path=model_name,
+            vad_model_path=vad_model if vad_filter else "",
+        )
 
     def transcribe(self, audio_path: str | Path, language: str | None = None):
         """
-        Transcribe an audio file.
+        Transcribe an audio file using whisper-cli.
 
         Args:
             audio_path (Union[str, Path]): Path to the audio file.
@@ -88,26 +212,46 @@ class Transcriber:
 
         Returns:
             tuple: A tuple containing:
-                - list: List of transcribed segments.
+                - list: List of transcribed segments (after sentence splitting).
                 - TranscriptionInfo: Information about the transcription.
         """
-        seg_gen, info = self.whisper_model.transcribe(
-            str(audio_path),
-            language=language,
-            vad_filter=self.use_vad_model,
-            vad_parameters=self.vad_options,
-            **self.asr_options,
-        )
+        total_duration = get_audio_duration(audio_path)
 
-        segments = []  # [Segment(start, end, text, words=[Word(start, end, word, probability)])]
-        timestamps = 0
-        with tqdm(total=int(info.duration), unit=" seconds") as pbar:
-            for seg in seg_gen:
-                segments.append(seg)
-                pbar.update(int(seg.end - timestamps))
-                timestamps = seg.end
-            if timestamps < info.duration:  # silence at the end of the audio
-                pbar.update(info.duration - timestamps)
+        # 进度条
+        pbar = tqdm(total=100, unit="%", desc="Transcribing")
+
+        def _progress_cb(pct: int) -> None:
+            delta = pct - pbar.n
+            if delta > 0:
+                pbar.update(delta)
+
+        # 调用 whisper-cli
+        cli_json = self.cli_backend.transcribe(
+            audio_path=str(audio_path),
+            lang=language,
+            progress_cb=_progress_cb,
+            extra_args=self._build_extra_args(),
+        )
+        pbar.close()
+
+        # JSON -> Segment 列表
+        segments = map_cli_json_to_segments(cli_json)
+
+        # 语言检测结果
+        # whisper-cli JSON: result.language 为短代码如 "en"
+        # (cli.cpp L723: whisper_lang_str(whisper_full_lang_id(ctx)))
+        detected_lang = language or cli_json.get("result", {}).get("language", "en")
+
+        # 估算 VAD 后时长（累加所有 segment 的有效时长）
+        duration_after_vad = sum(s.end - s.start for s in segments)
+        if duration_after_vad == 0:
+            duration_after_vad = total_duration
+
+        info = TranscriptionInfo(
+            language=detected_lang,
+            duration=total_duration,
+            duration_after_vad=duration_after_vad,
+        )
 
         if not segments:
             logger.warning(f"No speech found for {audio_path}")
@@ -116,22 +260,40 @@ class Transcriber:
             with Timer("Sentence Segmentation"):
                 result = self.sentence_split(segments, info.language)
 
-        info = TranscriptionInfo(
-            language=info.language, duration=get_audio_duration(audio_path), duration_after_vad=info.duration_after_vad
-        )
-
         logger.info(
-            f"VAD removed {format_timestamp(info.duration - info.duration_after_vad)}s of silence ({info.vad_ratio * 100}%) "
+            f"VAD removed {format_timestamp(info.duration - info.duration_after_vad)}s "
+            f"of silence ({info.vad_ratio * 100:.1f}%) "
         )
         if info.vad_ratio > 0.5:
             logger.warning(
                 f"VAD ratio is too high, check your audio quality. "
                 f"VAD ratio: {info.vad_ratio}, duration: {format_timestamp(info.duration, fmt='srt')}, "
                 f"duration_after_vad: {format_timestamp(info.duration_after_vad, fmt='srt')}. "
-                f"Try to decrease the threshold in vad_options."
             )
 
         return result, info
+
+    def _build_extra_args(self) -> list[str]:
+        """从 asr_options 构建额外的 whisper-cli 参数。
+
+        Returns:
+            额外 CLI 参数列表。
+        """
+        args: list[str] = []
+        opts = self.asr_options
+
+        if opts.get("beam_size", 5) > 1:
+            args.extend(["-bs", str(opts["beam_size"])])
+        if opts.get("best_of", 5) > 1:
+            args.extend(["-bo", str(opts["best_of"])])
+        if opts.get("initial_prompt"):
+            args.extend(["--prompt", str(opts["initial_prompt"])])
+        if opts.get("temperature", 0.0) != 0.0:
+            args.extend(["-t", str(opts["temperature"])])
+        if opts.get("suppress_nst", False):
+            args.append("-sns")
+
+        return args
 
     def sentence_split(self, segments: list[Segment], lang: str):
         """

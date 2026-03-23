@@ -13,16 +13,23 @@ class TranscriptionConfig:
     Configuration for the transcription stage.
 
     Args:
-        whisper_model: Name of whisper model. Default: ``large-v3``
-        compute_type: Computation type (``default``, ``int8``, ``int8_float16``,
-            ``int16``, ``float16``, ``float32``). Default: ``float16``
-        device: Device for computation. Default: ``cuda``
+        whisper_model: Path to whisper GGML model file, or model name.
+            Default: ``large-v3``
+        cli_path: Path to the whisper-cli executable. Default: ``whisper-cli``
+        vad_model: Path to the Silero VAD model for whisper.cpp.
+            Empty string disables native VAD. Default: ``""``
+        compute_type: Computation type (legacy, kept for compatibility).
+            Default: ``float16``
+        device: Device for computation (legacy, kept for compatibility).
+            Default: ``cuda``
         asr_options: Parameters for whisper model.
-        vad_options: Parameters for VAD model.
+        vad_options: Parameters for VAD model (legacy, kept for compatibility).
         preprocess_options: Options for audio preprocessing.
     """
 
-    whisper_model: str = "large-v3"
+    whisper_model: str = "whisper.cpp/models/ggml-base.bin"
+    cli_path: str = "whisper.cpp/build/bin/whisper-cli"
+    vad_model: str = "whisper.cpp/models/ggml-silero-v6.2.0.bin"
     compute_type: str = "float16"
     device: str = "cuda"
     asr_options: dict | None = None
