@@ -461,9 +461,7 @@ class GeminiBot(ChatBot):
         super().__init__(model_name, temperature, top_p, retry, max_async, fee_limit)
 
         self.model_name = model_name
-
-        # genai.configure(api_key=api_key or os.environ['GOOGLE_API_KEY'])
-        self.client = genai.Client(api_key=api_key or os.environ["GOOGLE_API_KEY"])
+        self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
 
         # Should not block any translation-related content.
         # self.safety_settings = {
@@ -542,13 +540,16 @@ class GeminiBot(ChatBot):
         #                                          safety_settings=self.safety_settings, system_instruction=system_msg)
         # client = genai.ChatSession(generative_model, history=history_messages)
         self.config.system_instruction = system_msg
+        
+        # Instantiate client here so its HTTP Pool attaches to the current asyncio event loop
+        client = genai.Client(api_key=self.api_key)
 
         response = None
         for i in range(self.retry):
             # try:
             # send_message_async is buggy, so we use send_message instead as a workaround
             # response = client.send_message(user_msg, safety_settings=self.safety_settings)
-            response = await self.client.aio.models.generate_content(
+            response = await client.aio.models.generate_content(
                 model=self.model_name, contents=user_msg, config=self.config
             )
             self.update_fee(response)
