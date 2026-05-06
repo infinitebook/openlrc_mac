@@ -11,6 +11,7 @@ from pathlib import Path
 
 class TestLazyImports(unittest.TestCase):
     FORBIDDEN_ROOTS = {"faster_whisper", "spacy", "tiktoken", "torch", "lingua"}
+    PROBE_MARKER = "__OPENLRC_LAZY_IMPORTS__="
 
     def _loaded_modules_after(self, statement: str):
         script = textwrap.dedent(
@@ -26,7 +27,7 @@ class TestLazyImports(unittest.TestCase):
                 if name == "openlrc.openlrc"
                 or name.split(".")[0] in {sorted(self.FORBIDDEN_ROOTS)}
             ]
-            print(json.dumps(sorted(interesting)))
+            print({self.PROBE_MARKER!r} + json.dumps(sorted(interesting)))
             """
         )
         result = subprocess.run(
@@ -36,7 +37,14 @@ class TestLazyImports(unittest.TestCase):
             cwd=Path(__file__).resolve().parents[1],
             text=True,
         )
-        return json.loads(result.stdout)
+        for line in result.stdout.splitlines():
+            if line.startswith(self.PROBE_MARKER):
+                return json.loads(line[len(self.PROBE_MARKER) :])
+
+        self.fail(
+            "lazy import probe did not emit a parseable result. "
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
 
     def test_config_import_does_not_load_openlrc_or_heavy_dependencies(self):
         loaded = self._loaded_modules_after("from openlrc import TranscriptionConfig, TranslationConfig")
