@@ -33,6 +33,17 @@ class ModelConfig:
             Overrides the built-in default when set.
         max_tokens (Optional[int]): Maximum output tokens per request.
             Overrides the built-in default when set.
+        extra_body (Optional[dict]): Provider-specific parameters passed through
+            to the underlying SDK.  Each chatbot subclass extracts the keys it
+            recognises (e.g. ``frequency_penalty`` for OpenAI, ``top_k`` for
+            Anthropic/Gemini) and forwards the remainder via the SDK's own
+            extension mechanism.  ``None`` (the default) produces the exact same
+            API call as before this field existed.
+
+            Do **not** include keys that are already managed by the chatbot
+            constructor or ``_create_chat`` (e.g. ``temperature``, ``top_p``,
+            ``stop``, ``max_tokens``, ``model``, ``messages``).  Behaviour is
+            undefined if such keys are present.
     """
 
     provider: ModelProvider
@@ -42,6 +53,7 @@ class ModelConfig:
     proxy: str | None = None
     context_window: int | None = None
     max_tokens: int | None = None
+    extra_body: dict | None = None
 
     def __str__(self):
         return f"{self.provider.value}:{self.name}"

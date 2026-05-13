@@ -238,6 +238,14 @@ class ChatBot:
 
 @_register_chatbot
 class GPTBot(ChatBot):
+    # Keys in ``extra_body`` that map directly to native OpenAI API parameters.
+    # They are extracted from ``extra_body`` and passed as top-level kwargs to
+    # ``client.chat.completions.create()``.  Everything else is forwarded via
+    # the SDK's ``extra_body`` kwarg (which adds them verbatim to the HTTP
+    # request body — useful for vLLM / custom endpoint parameters like
+    # ``repetition_penalty``, ``top_k``, or ``chat_template_kwargs``).
+    _NATIVE_EXTRA_KEYS = frozenset({"frequency_penalty", "presence_penalty", "seed"})
+
     def __init__(
         self,
         model_name: str = "gpt-4.1-nano",
@@ -250,6 +258,7 @@ class GPTBot(ChatBot):
         proxy: str | None = None,
         base_url_config: dict | None = None,
         api_key: str | None = None,
+        extra_body: dict | None = None,
     ):
 
         # clamp temperature to 0-2
@@ -271,6 +280,7 @@ class GPTBot(ChatBot):
 
         self.model_name = model_name
         self.json_mode = json_mode
+        self.extra_body = dict(extra_body) if extra_body else {}
 
     @staticmethod
     def _resolve_client_settings(api_key: str | None, base_url_config: dict | None) -> tuple[str, str | None]:
@@ -338,19 +348,34 @@ class GPTBot(ChatBot):
         effective_temperature = temperature if temperature is not None else self.temperature
         effective_top_p = top_p if top_p is not None else self.top_p
 
+        # Build the kwargs dict from extra_body.
+        # Native OpenAI keys become top-level kwargs; the rest go into extra_body.
+        native_kwargs: dict = {}
+        passthrough: dict = {}
+        for key, value in self.extra_body.items():
+            if key in self._NATIVE_EXTRA_KEYS:
+                native_kwargs[key] = value
+            else:
+                passthrough[key] = value
+
         response = None
         validated = False
         for i in range(self.retry):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,  # pyright: ignore[reportArgumentType]
-                    temperature=effective_temperature,
-                    top_p=effective_top_p,
-                    response_format={"type": "json_object" if self.json_mode else "text"},  # pyright: ignore[reportArgumentType]
-                    stop=stop_sequences,
-                    max_tokens=self._compute_max_tokens(messages),
-                )
+                create_kwargs: dict = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "temperature": effective_temperature,
+                    "top_p": effective_top_p,
+                    "response_format": {"type": "json_object" if self.json_mode else "text"},
+                    "stop": stop_sequences,
+                    "max_tokens": self._compute_max_tokens(messages),
+                    **native_kwargs,
+                }
+                if passthrough:
+                    create_kwargs["extra_body"] = passthrough
+
+                response = self.client.chat.completions.create(**create_kwargs)  # pyright: ignore[reportArgumentType]
                 self.update_fee(response)
                 if response.choices[0].finish_reason == "length":
                     usage = response.usage
@@ -418,6 +443,9 @@ class GPTBot(ChatBot):
 
 @_register_chatbot
 class ClaudeBot(ChatBot):
+    # Keys in ``extra_body`` that map to native Anthropic Messages API parameters.
+    _NATIVE_EXTRA_KEYS = frozenset({"top_k"})
+
     def __init__(
         self,
         model_name: str = "claude-3-5-sonnet-20241022",
@@ -429,6 +457,7 @@ class ClaudeBot(ChatBot):
         proxy: str | None = None,
         base_url_config: dict | None = None,
         api_key: str | None = None,
+        extra_body: dict | None = None,
     ):
 
         # clamp temperature to 0-1
@@ -444,6 +473,7 @@ class ClaudeBot(ChatBot):
 
         self.model_name = model_name
         self.max_tokens = self.model_info.max_tokens
+        self.extra_body = dict(extra_body) if extra_body else {}
 
     def update_fee(self, response: Message):
         model_info = self.model_info
@@ -484,6 +514,14 @@ class ClaudeBot(ChatBot):
         if messages[0]["role"] == "system":
             system_msg = messages.pop(0)["content"]
 
+        # Extract native Anthropic keys from extra_body.
+        native_kwargs: dict = {}
+        for key, value in self.extra_body.items():
+            if key in self._NATIVE_EXTRA_KEYS:
+                native_kwargs[key] = value
+            else:
+                logger.debug(f"ClaudeBot: ignoring unsupported extra_body key: {key!r}")
+
         response = None
         validated = False
         for i in range(self.retry):
@@ -496,6 +534,7 @@ class ClaudeBot(ChatBot):
                     top_p=effective_top_p,
                     stop_sequences=stop_sequences or omit,
                     max_tokens=max_tokens,
+                    **native_kwargs,
                 )
                 self.update_fee(response)
 
@@ -561,6 +600,9 @@ class ClaudeBot(ChatBot):
 
 @_register_chatbot
 class GeminiBot(ChatBot):
+    # Keys in ``extra_body`` that map to native Gemini GenerateContentConfig fields.
+    _NATIVE_EXTRA_KEYS = frozenset({"top_k", "seed", "presence_penalty", "frequency_penalty"})
+
     def __init__(
         self,
         model_name: str = "gemini-2.5-flash-preview-04-17",
@@ -572,6 +614,7 @@ class GeminiBot(ChatBot):
         proxy: str | None = None,
         base_url_config: dict | None = None,
         api_key: str | None = None,
+        extra_body: dict | None = None,
     ):
         # clamp temperature to 0-1
         temperature = max(0, min(1, temperature))
@@ -579,6 +622,7 @@ class GeminiBot(ChatBot):
         super().__init__(model_name, temperature, top_p, retry, max_async, fee_limit)
 
         self.model_name = model_name
+        self.extra_body = dict(extra_body) if extra_body else {}
 
         # genai.configure(api_key=api_key or os.environ['GOOGLE_API_KEY'])
         self.client = genai.Client(api_key=api_key or os.environ["GOOGLE_API_KEY"])
@@ -654,6 +698,14 @@ class GeminiBot(ChatBot):
             content = message.pop("content")
             history_messages[i]["parts"] = [{"text": content}]
 
+        # Extract native Gemini keys from extra_body.
+        native_kwargs: dict = {}
+        for key, value in self.extra_body.items():
+            if key in self._NATIVE_EXTRA_KEYS:
+                native_kwargs[key] = value
+            else:
+                logger.debug(f"GeminiBot: ignoring unsupported extra_body key: {key!r}")
+
         # Build config per-call so temperature/top_p can vary across callers sharing this bot.
         config = types.GenerateContentConfig(
             temperature=effective_temperature,
@@ -661,6 +713,7 @@ class GeminiBot(ChatBot):
             safety_settings=self.safety_settings,
             stop_sequences=stop_sequences,
             system_instruction=system_msg,
+            **native_kwargs,
         )
 
         response = None

@@ -226,6 +226,102 @@ class TestChatBot(unittest.TestCase):
         self.assertEqual(captured[0], 0.7)
 
 
+class TestExtraBody(unittest.TestCase):
+    """Tests for the extra_body passthrough feature (issue #128)."""
+
+    def test_gpt_extra_body_splits_native_and_passthrough(self):
+        """Native keys (frequency_penalty, seed) become top-level kwargs;
+        non-native keys (top_k, chat_template_kwargs) go into extra_body."""
+        bot = GPTBot(
+            model_name="gpt-4.1-nano",
+            api_key="test-key",
+            extra_body={
+                "frequency_penalty": 0.3,
+                "seed": 42,
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        captured: list[dict] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(dict(kwargs))
+            raise openai.AuthenticationError(
+                message="test", response=httpx.Response(401), body=None
+            )
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}])
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        call = captured[0]
+
+        # Native keys should be top-level kwargs
+        self.assertEqual(call["frequency_penalty"], 0.3)
+        self.assertEqual(call["seed"], 42)
+
+        # Non-native keys should be in extra_body
+        self.assertIn("extra_body", call)
+        self.assertEqual(call["extra_body"]["top_k"], 20)
+        self.assertEqual(
+            call["extra_body"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+        # Native keys should NOT be in extra_body
+        self.assertNotIn("frequency_penalty", call["extra_body"])
+        self.assertNotIn("seed", call["extra_body"])
+
+    def test_gpt_no_extra_body_matches_original_behavior(self):
+        """When extra_body is not provided, the API call should not contain
+        extra_body or any extra native kwargs — identical to pre-change behavior."""
+        bot = GPTBot(model_name="gpt-4.1-nano", api_key="test-key")
+
+        captured: list[dict] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(dict(kwargs))
+            raise openai.AuthenticationError(
+                message="test", response=httpx.Response(401), body=None
+            )
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}])
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        call = captured[0]
+
+        # No extra_body kwarg should be present
+        self.assertNotIn("extra_body", call)
+
+        # No native extra keys should be present
+        self.assertNotIn("frequency_penalty", call)
+        self.assertNotIn("presence_penalty", call)
+        self.assertNotIn("seed", call)
+
+    def test_extra_body_shallow_copy_isolates_mutations(self):
+        """Mutating the original dict after constructing the bot should not
+        affect the bot's extra_body."""
+        original = {"top_k": 20, "seed": 42}
+        bot = GPTBot(model_name="gpt-4.1-nano", api_key="test-key", extra_body=original)
+
+        # Mutate the original dict
+        original["top_k"] = 999
+        original["new_key"] = "surprise"
+
+        # Bot should still have the original values
+        self.assertEqual(bot.extra_body["top_k"], 20)
+        self.assertEqual(bot.extra_body["seed"], 42)
+        self.assertNotIn("new_key", bot.extra_body)
+
+
 class TestThirdPartyBot(unittest.TestCase):
     def test_beta_base_url(self):
         bot = GPTBot(

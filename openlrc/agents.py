@@ -59,6 +59,7 @@ def create_chatbot(
             retry=4,
             base_url_config=base_url_config,
             api_key=chatbot_model.api_key,
+            extra_body=chatbot_model.extra_body,
         )
 
         # Override model_info with user-specified capability parameters.
