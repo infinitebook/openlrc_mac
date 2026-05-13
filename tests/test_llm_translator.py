@@ -471,3 +471,108 @@ class TestLLMTranslatorTranslate(unittest.TestCase):
         mock_reviewer.build_context.assert_not_called()
         # translate_chunk called only once (for chunk 2)
         mock_agent.translate_chunk.assert_called_once()
+
+
+class TestCheckpoint(unittest.TestCase):
+    """Unit tests for BaseLLMTranslator._save_checkpoint / _load_checkpoint."""
+
+    def _make_translator(self):
+        return LLMTranslator(chatbot=_make_mock_chatbot(), chunk_size=30)
+
+    def test_save_checkpoint_produces_expected_json(self):
+        """_save_checkpoint writes JSON with 'compare' key plus context keys."""
+        translator = self._make_translator()
+        compare_list = [
+            {"chunk": 1, "idx": 1, "method": "chunked", "model": "gpt-4", "input": "hello", "output": "你好"},
+            {"chunk": 1, "idx": 2, "method": "chunked", "model": "gpt-4", "input": "world", "output": "世界"},
+        ]
+        context = {"summaries": ["A greeting."], "scene": "office", "guideline": "Translate naturally."}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            translator._save_checkpoint(path, compare_list, context)
+
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+
+        self.assertEqual(data["compare"], compare_list)
+        self.assertEqual(data["summaries"], ["A greeting."])
+        self.assertEqual(data["scene"], "office")
+        self.assertEqual(data["guideline"], "Translate naturally.")
+
+    def test_load_checkpoint_restores_state(self):
+        """_load_checkpoint correctly restores translations, compare_list, start_chunk, and context."""
+        translator = self._make_translator()
+
+        saved = {
+            "compare": [
+                {"chunk": 1, "idx": 1, "method": "chunked", "model": "gpt-4", "input": "hello", "output": "你好"},
+                {"chunk": 1, "idx": 2, "method": "chunked", "model": "gpt-4", "input": "world", "output": "世界"},
+                {"chunk": 2, "idx": 3, "method": "atomic", "model": "gpt-4", "input": "foo", "output": "富"},
+            ],
+            "summaries": ["sum1", "sum2"],
+            "scene": "park",
+            "guideline": "Be concise.",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(saved, f)
+
+            translations, compare_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, ["你好", "世界", "富"])
+        self.assertEqual(len(compare_list), 3)
+        self.assertEqual(start_chunk, 2)
+        self.assertEqual(ctx["summaries"], ["sum1", "sum2"])
+        self.assertEqual(ctx["scene"], "park")
+        self.assertEqual(ctx["guideline"], "Be concise.")
+
+    def test_load_checkpoint_file_not_exists(self):
+        """_load_checkpoint returns empty defaults when file does not exist."""
+        translator = self._make_translator()
+        translations, compare_list, start_chunk, ctx = translator._load_checkpoint(Path("/nonexistent/path.json"))
+
+        self.assertEqual(translations, [])
+        self.assertEqual(compare_list, [])
+        self.assertEqual(start_chunk, 0)
+        self.assertEqual(ctx, {})
+
+    def test_load_checkpoint_empty_compare_list(self):
+        """_load_checkpoint handles empty compare list without IndexError."""
+        translator = self._make_translator()
+
+        saved = {"compare": [], "summaries": [], "guideline": "test"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(saved, f)
+
+            translations, compare_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, [])
+        self.assertEqual(compare_list, [])
+        self.assertEqual(start_chunk, 0)
+        self.assertEqual(ctx["guideline"], "test")
+
+    def test_save_load_roundtrip(self):
+        """Data survives a save -> load roundtrip with identical semantics."""
+        translator = self._make_translator()
+        compare_list = [
+            {"chunk": 3, "idx": 7, "method": "chunked", "model": "gpt-4", "input": "hi", "output": "嗨"},
+        ]
+        context = {"summaries": ["s1", "s2", "s3"], "scene": "beach", "guideline": "Keep it casual."}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            translator._save_checkpoint(path, compare_list, context)
+            translations, loaded_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, ["嗨"])
+        self.assertEqual(loaded_list, compare_list)
+        self.assertEqual(start_chunk, 3)
+        self.assertEqual(ctx["summaries"], ["s1", "s2", "s3"])
+        self.assertEqual(ctx["scene"], "beach")
+        self.assertEqual(ctx["guideline"], "Keep it casual.")

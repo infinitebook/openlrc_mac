@@ -25,17 +25,19 @@ class Translator(ABC):
         pass
 
 
-class LLMTranslator(Translator):
-    """
-    Translator using Large Language Models for translation.
-    This class implements a sophisticated translation process using chunking,
-    context-aware translation, and fallback mechanisms.
+class BaseLLMTranslator(Translator):
+    """Base class for LLM-based translators.
+
+    Provides shared infrastructure used by all LLM translator variants:
+    chunking (by line count, token budget, and scene boundaries), atomic
+    (per-line) translation fallback, checkpoint save/load for resumption,
+    and compare-list generation for debugging.
+
+    Subclasses implement :meth:`translate` and their own chunk-level
+    translation strategy.
     """
 
     CHUNK_SIZE = 30
-    RETRY_STREAK = 10  # Number of consecutive chunks to use retry model after a failure
-    LINE_MISMATCH_RETRIES = 2  # Max attempts per agent for line-count mismatch recovery
-    MIN_SPLIT_SIZE = 3  # Minimum chunk size for binary-split retry; below this, use atomic
     MAX_CHUNK_TOKENS = 1000  # Token budget per chunk (text content only, excludes prompt overhead)
     SCENE_THRESHOLD = 30.0  # Seconds of silence that indicates a scene boundary
 
@@ -45,31 +47,17 @@ class LLMTranslator(Translator):
         chatbot: ChatBot,
         retry_chatbot: ChatBot | None = None,
         chunk_size: int = CHUNK_SIZE,
-        intercept_line: int | None = None,
-        chunked_guideline: bool = False,
         timestamps: list[tuple[float, float | None]] | None = None,
     ):
-        """
-        Initialize the LLMTranslator with given parameters.
-
-        Args:
-            chatbot: Primary ChatBot instance for translation.
-            retry_chatbot: Optional ChatBot instance for retry attempts.
-            chunk_size: Maximum lines per chunk for processing.
-            intercept_line: Line number to intercept translation, useful for debugging.
-            chunked_guideline: Enable chunked guideline generation for long texts. Default: False.
-            timestamps: Optional list of (start, end) per line for scene-aware chunking.
-                When provided, chunk splitting respects scene boundaries (time gaps > SCENE_THRESHOLD).
-                When None, only token budget and line-count limits apply.
-        """
         self.chatbot = chatbot
         self.retry_chatbot = retry_chatbot
         self.chunk_size = chunk_size
-        self.api_fee = 0
-        self.intercept_line = intercept_line
-        self.chunked_guideline = chunked_guideline
         self.timestamps = timestamps
-        self.use_retry_cnt = 0
+        self.api_fee = 0.0
+
+    # ------------------------------------------------------------------
+    # Chunking
+    # ------------------------------------------------------------------
 
     @staticmethod
     def make_chunks(texts: list[str], chunk_size: int = 30) -> list[list[tuple[int, str]]]:
@@ -222,6 +210,164 @@ class LLMTranslator(Translator):
                     best_idx = i
 
         return best_idx
+
+    def atomic_translate(self, chatbot: ChatBot, texts: list[str], src_lang: str, target_lang: str) -> list[str]:
+        """
+        Perform atomic translation for each text individually.
+
+        This method is used as a fallback when chunk translation fails. It translates
+        each text separately, which can be slower but more reliable for problematic texts.
+
+        Args:
+            chatbot (ChatBot): ChatBot instance to use for translation.
+            texts (List[str]): List of texts to translate.
+            src_lang (str): Source language code.
+            target_lang (str): Target language code.
+
+        Returns:
+            List[str]: List of translated texts.
+
+        Raises:
+            ChatBotException: If the number of translated texts doesn't match the input.
+        """
+        from openlrc.agents import ChunkedTranslatorAgent as _CTA
+
+        prompter = AtomicTranslatePrompter(src_lang, target_lang)
+        message_lists = [[{"role": "user", "content": prompter.user(text)}] for text in texts]
+
+        responses = chatbot.message(message_lists, output_checker=prompter.check_format, temperature=_CTA.TEMPERATURE)
+        self.api_fee += sum(chatbot.api_fees[-(len(texts)) :])
+        translated = list(map(chatbot.get_content, responses))
+
+        if len(translated) != len(texts):
+            raise ChatBotException(
+                f"Atomic translation failed: expected {len(texts)} translations, got {len(translated)}"
+            )
+
+        return translated
+
+    def _save_checkpoint(
+        self, compare_path: Path, compare_list: list[dict], context: dict
+    ) -> None:
+        """Save translation checkpoint for potential resumption.
+
+        Args:
+            compare_path: Path to save the checkpoint JSON file.
+            compare_list: List of per-line comparison records.
+            context: Subclass-specific context data (e.g. summaries, guideline,
+                sliding window).  Stored alongside ``compare_list`` in the JSON.
+        """
+        data = {"compare": compare_list, **context}
+        with open(compare_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+    def _load_checkpoint(
+        self, compare_path: Path
+    ) -> tuple[list[str], list[dict], int, dict]:
+        """Load translation checkpoint for resumption.
+
+        Args:
+            compare_path: Path to the checkpoint JSON file.
+
+        Returns:
+            A 4-tuple of ``(translations, compare_list, start_chunk, context)``.
+            *translations* are the already-translated texts extracted from
+            *compare_list*.  *start_chunk* is the chunk number to resume from.
+            *context* is the remaining data dict (subclass-specific).
+            If the file does not exist, returns empty defaults.
+        """
+        if not compare_path.exists():
+            return [], [], 0, {}
+
+        logger.info(f"Resuming translation from {compare_path}")
+        with open(compare_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        compare_list = data.pop("compare")
+        translations = [item["output"] for item in compare_list]
+        start_chunk = compare_list[-1]["chunk"] if compare_list else 0
+        return translations, compare_list, start_chunk, data
+
+    @staticmethod
+    def _generate_compare_list(
+        chunk: list[tuple[int, str]],
+        translated: list[str],
+        chunk_id: int,
+        atomic: bool,
+        context: TranslationContext,
+    ) -> list[dict]:
+        """
+        Generate a comparison list for the translated chunk.
+
+        This method creates a detailed record of each translation, including the original text,
+        translated text, and metadata about the translation process.
+
+        Args:
+            chunk (List[Tuple[int, str]]): Original chunk of text.
+            translated (List[str]): Translated texts.
+            chunk_id (int): ID of the current chunk.
+            atomic (bool): Whether atomic translation was used.
+            context (TranslationContext): Current translation context.
+
+        Returns:
+            List[dict]: List of dictionaries containing comparison information.
+        """
+        return [
+            {
+                "chunk": chunk_id,
+                "idx": item[0] if item else "N/A",
+                "method": "atomic" if atomic else "chunked",
+                "model": str(context.model),
+                "input": item[1] if item else "N/A",
+                "output": trans if trans else "N/A",
+            }
+            for (item, trans) in zip_longest(chunk, translated)
+        ]
+
+
+class LLMTranslator(BaseLLMTranslator):
+    """Translator using Large Language Models for translation.
+
+    This class implements a sophisticated translation process using chunking,
+    context-aware translation, and fallback mechanisms.
+    """
+
+    RETRY_STREAK = 10  # Number of consecutive chunks to use retry model after a failure
+    LINE_MISMATCH_RETRIES = 2  # Max attempts per agent for line-count mismatch recovery
+    MIN_SPLIT_SIZE = 3  # Minimum chunk size for binary-split retry; below this, use atomic
+
+    def __init__(
+        self,
+        *,
+        chatbot: ChatBot,
+        retry_chatbot: ChatBot | None = None,
+        chunk_size: int = BaseLLMTranslator.CHUNK_SIZE,
+        intercept_line: int | None = None,
+        chunked_guideline: bool = False,
+        timestamps: list[tuple[float, float | None]] | None = None,
+    ):
+        """
+        Initialize the LLMTranslator with given parameters.
+
+        Args:
+            chatbot: Primary ChatBot instance for translation.
+            retry_chatbot: Optional ChatBot instance for retry attempts.
+            chunk_size: Maximum lines per chunk for processing.
+            intercept_line: Line number to intercept translation, useful for debugging.
+            chunked_guideline: Enable chunked guideline generation for long texts. Default: False.
+            timestamps: Optional list of (start, end) per line for scene-aware chunking.
+                When provided, chunk splitting respects scene boundaries (time gaps > SCENE_THRESHOLD).
+                When None, only token budget and line-count limits apply.
+        """
+        super().__init__(
+            chatbot=chatbot,
+            retry_chatbot=retry_chatbot,
+            chunk_size=chunk_size,
+            timestamps=timestamps,
+        )
+        self.intercept_line = intercept_line
+        self.chunked_guideline = chunked_guideline
+        self.use_retry_cnt = 0
 
     @staticmethod
     def _is_valid_translation(translated: list[str] | None, expected_len: int) -> bool:
@@ -419,7 +565,11 @@ class LLMTranslator(Translator):
         chunks = self.make_chunks_by_tokens(texts)
         logger.info(f"Translating {info.title}: {len(chunks)} chunks, {len(texts)} lines in total.")
 
-        translations, summaries, compare_list, start_chunk, guideline = self._resume_translation(compare_path)
+        # Load checkpoint — unpack subclass-specific context from the dict.
+        translations, compare_list, start_chunk, ctx = self._load_checkpoint(compare_path)
+        summaries: list[str] = ctx.get("summaries", [])
+        guideline: str = ctx.get("guideline", "")
+
         if not guideline:
             logger.info("Building translation guideline.")
             context_reviewer = ContextReviewerAgent(
@@ -457,7 +607,11 @@ class LLMTranslator(Translator):
             logger.debug(f"Scene: {context.scene}")
 
             compare_list.extend(self._generate_compare_list(chunk, translated, i, atomic, context))
-            self._save_intermediate_results(compare_path, compare_list, summaries, context.scene or "", guideline)
+            self._save_checkpoint(
+                compare_path,
+                compare_list,
+                {"summaries": summaries, "scene": context.scene or "", "guideline": guideline},
+            )
             context.previous_summaries = summaries
 
         self.api_fee += translator_agent.cost + (retry_agent.cost if retry_agent else 0)
@@ -465,130 +619,6 @@ class LLMTranslator(Translator):
         logger.info(f"Translation complete for {info.title}. Fee: {self.api_fee:.4f} USD")
 
         return translations
-
-    def _resume_translation(self, compare_path: Path) -> tuple[list[str], list[str], list[dict], int, str]:
-        """
-        Resume translation from a saved state.
-
-        This method allows the translation process to be resumed from a previous point,
-        which is useful for long translations or in case of interruptions.
-
-        Args:
-            compare_path (Path): Path to the saved translation state.
-
-        Returns:
-            Tuple[List[str], List[str], List[dict], int, str]: Tuple containing:
-                - translations: List of already translated texts.
-                - summaries: List of translation summaries.
-                - compare_list: List of dictionaries for comparison.
-                - start_chunk: The chunk number to resume from.
-                - guideline: The translation guideline.
-        """
-        translations, summaries, compare_list, start_chunk, guideline = [], [], [], 0, ""
-
-        if compare_path.exists():
-            logger.info(f"Resuming translation from {compare_path}")
-            with open(compare_path, encoding="utf-8") as f:
-                compare_results = json.load(f)
-            compare_list = compare_results["compare"]
-            summaries = compare_results["summaries"]
-            translations = [item["output"] for item in compare_list]
-            start_chunk = compare_list[-1]["chunk"]
-            guideline = compare_results["guideline"]
-            logger.info(f"Resuming translation from chunk {start_chunk}")
-
-        return translations, summaries, compare_list, start_chunk, guideline
-
-    def _generate_compare_list(
-        self,
-        chunk: list[tuple[int, str]],
-        translated: list[str],
-        chunk_id: int,
-        atomic: bool,
-        context: TranslationContext,
-    ) -> list[dict]:
-        """
-        Generate a comparison list for the translated chunk.
-
-        This method creates a detailed record of each translation, including the original text,
-        translated text, and metadata about the translation process.
-
-        Args:
-            chunk (List[Tuple[int, str]]): Original chunk of text.
-            translated (List[str]): Translated texts.
-            chunk_id (int): ID of the current chunk.
-            atomic (bool): Whether atomic translation was used.
-            context (TranslationContext): Current translation context.
-
-        Returns:
-            List[dict]: List of dictionaries containing comparison information.
-        """
-        return [
-            {
-                "chunk": chunk_id,
-                "idx": item[0] if item else "N/A",
-                "method": "atomic" if atomic else "chunked",
-                "model": str(context.model),
-                "input": item[1] if item else "N/A",
-                "output": trans if trans else "N/A",
-            }
-            for (item, trans) in zip_longest(chunk, translated)
-        ]
-
-    def _save_intermediate_results(
-        self, compare_path: Path, compare_list: list[dict], summaries: list[str], scene: str, guideline: str
-    ):
-        """
-        Save intermediate translation results to a file.
-
-        This method saves the current state of the translation process, allowing for
-        potential resumption of the translation task later.
-
-        Args:
-            compare_path (Path): Path to save the results.
-            compare_list (List[dict]): List of comparison dictionaries.
-            summaries (List[str]): List of translation summaries.
-            scene (str): Current scene description.
-            guideline (str): Translation guideline.
-        """
-        compare_results = {"compare": compare_list, "summaries": summaries, "scene": scene, "guideline": guideline}
-        with open(compare_path, "w", encoding="utf-8") as f:
-            json.dump(compare_results, f, indent=4, ensure_ascii=False)
-
-    def atomic_translate(self, chatbot: ChatBot, texts: list[str], src_lang: str, target_lang: str) -> list[str]:
-        """
-        Perform atomic translation for each text individually.
-
-        This method is used as a fallback when chunk translation fails. It translates
-        each text separately, which can be slower but more reliable for problematic texts.
-
-        Args:
-            chatbot (ChatBot): ChatBot instance to use for translation.
-            texts (List[str]): List of texts to translate.
-            src_lang (str): Source language code.
-            target_lang (str): Target language code.
-
-        Returns:
-            List[str]: List of translated texts.
-
-        Raises:
-            AssertionError: If the number of translated texts doesn't match the input.
-        """
-        from openlrc.agents import ChunkedTranslatorAgent as _CTA
-
-        prompter = AtomicTranslatePrompter(src_lang, target_lang)
-        message_lists = [[{"role": "user", "content": prompter.user(text)}] for text in texts]
-
-        responses = chatbot.message(message_lists, output_checker=prompter.check_format, temperature=_CTA.TEMPERATURE)
-        self.api_fee += sum(chatbot.api_fees[-(len(texts)) :])
-        translated = list(map(chatbot.get_content, responses))
-
-        if len(translated) != len(texts):
-            raise ChatBotException(
-                f"Atomic translation failed: expected {len(texts)} translations, got {len(translated)}"
-            )
-
-        return translated
 
 
 class MSTranslator(Translator):
