@@ -9,6 +9,7 @@ class ModelProvider(Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GOOGLE = "google"
+    LITELLM = "litellm"
     THIRD_PARTY = "third_party"
 
 
@@ -425,6 +426,22 @@ class Models:
                 output_price=3.0,
                 max_tokens=8192,
                 context_window=32768,
+                vision_support=False,
+                knowledge_cutoff=None,
+                latest_alias=None,
+            )
+
+    class DefaultLiteLLMModelInfo(ModelInfo):
+        """Default configuration for LiteLLM-routed models."""
+
+        def __init__(self, model_name: str):
+            super().__init__(
+                name=model_name,
+                provider=ModelProvider.LITELLM,
+                input_price=1.0,
+                output_price=1.0,
+                max_tokens=8192,
+                context_window=128000,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,

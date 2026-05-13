@@ -52,6 +52,9 @@ full = [
     "torchaudio>=2.0.0",
     "deepfilternet>=0.5.6,<0.6",
 ]
+litellm = [
+    "litellm>=1.60,<1.85",
+]
 
 [project.urls]
 Homepage = "https://github.com/zh-plus/openlrc"
