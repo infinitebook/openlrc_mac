@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import uuid
 from abc import ABC, abstractmethod
 from itertools import zip_longest
@@ -15,8 +16,14 @@ from openlrc.chatbot import ChatBot
 from openlrc.context import TranslateInfo, TranslationContext
 from openlrc.exceptions import ChatBotException
 from openlrc.logger import logger
-from openlrc.prompter import AtomicTranslatePrompter
+from openlrc.prompter import (
+    LEAN_RETRY_INSTRUCTION,
+    AtomicTranslatePrompter,
+    LeanContextReviewPrompter,
+    LeanTranslatePrompter,
+)
 from openlrc.utils import get_text_token_number
+from openlrc.validators import LeanTranslateValidator
 
 
 class Translator(ABC):
@@ -48,11 +55,13 @@ class BaseLLMTranslator(Translator):
         retry_chatbot: ChatBot | None = None,
         chunk_size: int = CHUNK_SIZE,
         timestamps: list[tuple[float, float | None]] | None = None,
+        chunked_guideline: bool = False,
     ):
         self.chatbot = chatbot
         self.retry_chatbot = retry_chatbot
         self.chunk_size = chunk_size
         self.timestamps = timestamps
+        self.chunked_guideline = chunked_guideline
         self.api_fee = 0.0
 
     # ------------------------------------------------------------------
@@ -325,6 +334,500 @@ class BaseLLMTranslator(Translator):
         ]
 
 
+class LeanTranslator(BaseLLMTranslator):
+    """Lightweight LLM translator optimised for token efficiency.
+
+    Compared to :class:`LLMTranslator`, this class:
+
+    * Uses a simplified single-task prompt (~150 tokens vs ~839).
+    * Replaces accumulated historical summaries with a fixed-budget
+      sliding window of recent translation pairs.
+    * Aligns output via ``#id`` anchors instead of strict line-count
+      matching, tolerating minor omissions and ID offsets.
+    * Supports a separate *cr_chatbot* for Context Review so that a
+      cheap/fast MT model can handle translation while a larger LLM
+      handles CR.
+    """
+
+    SLIDING_WINDOW_BUDGET = 150  # Max tokens for the recent-translations window
+    ANCHOR_OFFSET_TOLERANCE = 3  # Max ID offset for fuzzy anchor matching
+    ATOMIC_FILL_THRESHOLD = 0.2  # Missing ≤20% → atomic fill; >20% → full retry
+    MAX_CHUNK_RETRIES = 2  # Full-chunk retries before falling back
+    MIN_SPLIT_SIZE = 3  # Minimum chunk size for binary-split retry; below this, use atomic
+
+    def __init__(
+        self,
+        *,
+        chatbot: ChatBot,
+        retry_chatbot: ChatBot | None = None,
+        cr_chatbot: ChatBot | None = None,
+        chunk_size: int = BaseLLMTranslator.CHUNK_SIZE,
+        timestamps: list[tuple[float, float | None]] | None = None,
+        enable_cr: bool = True,
+        chunked_guideline: bool = False,
+    ):
+        """
+        Args:
+            chatbot: Primary ChatBot for translation.
+            retry_chatbot: Optional fallback ChatBot for retries.
+            cr_chatbot: Optional separate ChatBot for Context Review.
+                When *enable_cr* is True and *cr_chatbot* is None, *chatbot*
+                is used for CR.
+            chunk_size: Maximum lines per chunk.
+            timestamps: Optional per-line (start, end) for scene-aware chunking.
+            enable_cr: Whether to run Context Review before translation.
+            chunked_guideline: Enable chunked guideline generation for long texts.
+        """
+        super().__init__(
+            chatbot=chatbot,
+            retry_chatbot=retry_chatbot,
+            chunk_size=chunk_size,
+            timestamps=timestamps,
+            chunked_guideline=chunked_guideline,
+        )
+        self.cr_chatbot = cr_chatbot
+        self.enable_cr = enable_cr
+
+    def _align_translations(
+        self,
+        expected_ids: list[int],
+        parsed: dict[int, str],
+    ) -> tuple[list[str | None], list[int]]:
+        """Align parsed anchor translations to the expected line IDs.
+
+        Returns ``(aligned, missing_ids)`` where *aligned* has one entry
+        per *expected_ids* (``None`` for unmatched lines) and *missing_ids*
+        lists the IDs that could not be matched.
+        """
+        aligned: list[str | None] = []
+        missing: list[int] = []
+
+        for eid in expected_ids:
+            # Exact match
+            if eid in parsed:
+                aligned.append(parsed.pop(eid))
+                continue
+
+            # Fuzzy match: try offsets ±1 … ±ANCHOR_OFFSET_TOLERANCE
+            found = False
+            for offset in range(1, self.ANCHOR_OFFSET_TOLERANCE + 1):
+                for candidate in (eid + offset, eid - offset):
+                    if candidate in parsed:
+                        aligned.append(parsed.pop(candidate))
+                        found = True
+                        break
+                if found:
+                    break
+
+            if not found:
+                aligned.append(None)
+                missing.append(eid)
+
+        return aligned, missing
+
+    @staticmethod
+    def _build_sliding_window(
+        recent_pairs: list[tuple[int, str, str] | list],
+        budget: int,
+    ) -> str:
+        """Build a sliding-window context string from recent translation pairs.
+
+        Args:
+            recent_pairs: List of ``(line_id, source, translation)`` triples
+                (or lists after JSON roundtrip), ordered chronologically
+                (oldest first).
+            budget: Maximum token budget for the window.
+
+        Returns:
+            Formatted string of recent pairs that fits within *budget*.
+        """
+        lines: list[str] = []
+        used = 0
+        for line_id, src, tgt in reversed(recent_pairs):
+            entry = f"#{line_id} {src} | {tgt}"
+            tokens = get_text_token_number(entry)
+            if used + tokens > budget:
+                break
+            lines.append(entry)
+            used += tokens
+        return "\n".join(reversed(lines))
+
+    def translate(
+        self,
+        texts: str | list[str],
+        src_lang: str,
+        target_lang: str,
+        info: TranslateInfo | None = None,
+        compare_path: Path = Path("translate_intermediate.json"),
+    ) -> list[str]:
+        """Translate *texts* using the lean single-task prompt strategy."""
+        if info is None:
+            info = TranslateInfo()
+        if not isinstance(texts, list):
+            texts = [texts]
+        if not texts:
+            return []
+
+        prompter = LeanTranslatePrompter(src_lang, target_lang)
+
+        # --- Context Review (optional) --------------------------------
+        summary = ""
+        characters = ""
+        terminology = ""
+        guideline = ""
+
+        cr_fee_start = len(self.cr_chatbot.api_fees) if self.cr_chatbot else 0
+        retry_fee_start = len(self.retry_chatbot.api_fees) if self.retry_chatbot else 0
+
+        # Load checkpoint
+        translations, compare_list, start_chunk, ctx = self._load_checkpoint(compare_path)
+        recent_pairs: list[tuple[int, str, str] | list] = ctx.get("recent_pairs", [])
+        guideline = ctx.get("guideline", "")
+
+        if self.enable_cr and not guideline:
+            cr_bot = self.cr_chatbot or self.chatbot
+            logger.info("Building translation guideline via Context Review.")
+            context_reviewer = ContextReviewerAgent(
+                src_lang,
+                target_lang,
+                info,
+                chatbot=cr_bot,
+                retry_chatbot=self.retry_chatbot,
+                chunked_guideline=self.chunked_guideline,
+                prompter=LeanContextReviewPrompter(src_lang, target_lang),
+            )
+            guideline = context_reviewer.build_context(
+                texts,
+                title=info.title or "",
+                glossary=info.glossary,
+                forced_glossary=info.forced_glossary,
+            )
+            logger.debug(f"Translation Guideline:\n{guideline}")
+
+        if guideline:
+            summary, characters, terminology = self._extract_cr_context(guideline)
+
+        # Inject user-provided glossary into terminology so it always
+        # reaches the translation prompt, regardless of CR.
+        if info.glossary:
+            user_glossary = "\n".join(f"- {k}: {v}" for k, v in info.glossary.items())
+            terminology = f"{terminology}\n{user_glossary}" if terminology else user_glossary
+
+        # --- Chunk and translate --------------------------------------
+        chunks = self.make_chunks_by_tokens(texts)
+        logger.info(f"Translating {info.title}: {len(chunks)} chunks, {len(texts)} lines in total.")
+
+        fee_start = len(self.chatbot.api_fees)
+
+        for i, chunk in list(enumerate(chunks, start=1))[start_chunk:]:
+            expected_ids = [line_id for line_id, _ in chunk]
+            source_texts = {line_id: text for line_id, text in chunk}
+
+            # Build prompts (with and without terminology for glossary-removal retry)
+            window_str = self._build_sliding_window(recent_pairs, self.SLIDING_WINDOW_BUDGET)
+            formatted = prompter.format_texts(chunk)
+            user_msg = prompter.user(
+                formatted,
+                summary=summary,
+                characters=characters,
+                terminology=terminology,
+                sliding_window=window_str,
+            )
+            user_msg_no_glossary = (
+                prompter.user(
+                    formatted,
+                    summary=summary,
+                    characters=characters,
+                    terminology="",
+                    sliding_window=window_str,
+                )
+                if terminology
+                else None
+            )
+
+            # Update validator for this chunk's expected IDs
+            prompter.update_expected_ids(expected_ids)
+
+            # Translate with retries
+            translated, used_atomic = self._translate_lean_chunk(
+                prompter, user_msg, expected_ids, source_texts, src_lang, target_lang,
+                user_msg_no_glossary=user_msg_no_glossary,
+            )
+
+            translations.extend(translated)
+
+            # Update sliding window with new pairs
+            for line_id, text in chunk:
+                idx = expected_ids.index(line_id)
+                recent_pairs.append((line_id, text, translated[idx]))
+
+            # Build compare list and save checkpoint
+            context_obj = TranslationContext(guideline=guideline)
+            compare_list.extend(
+                self._generate_compare_list(chunk, translated, i, used_atomic, context_obj)
+            )
+            self._save_checkpoint(
+                compare_path,
+                compare_list,
+                {"guideline": guideline, "recent_pairs": recent_pairs},
+            )
+
+            logger.info(f"Translated {info.title}: {i}/{len(chunks)}")
+
+        self.api_fee += sum(self.chatbot.api_fees[fee_start:])
+        if self.cr_chatbot:
+            self.api_fee += sum(self.cr_chatbot.api_fees[cr_fee_start:])
+        if self.retry_chatbot:
+            self.api_fee += sum(self.retry_chatbot.api_fees[retry_fee_start:])
+
+        logger.info(f"Translation complete for {info.title}. Fee: {self.api_fee:.4f} USD")
+        return translations
+
+    def _translate_lean_chunk(
+        self,
+        prompter: LeanTranslatePrompter,
+        user_msg: str,
+        expected_ids: list[int],
+        source_texts: dict[int, str],
+        src_lang: str,
+        target_lang: str,
+        user_msg_no_glossary: str | None = None,
+    ) -> tuple[list[str], bool]:
+        """Translate one chunk with the full retry chain.
+
+        Retry chain:
+        1. Primary chatbot (up to ``MAX_CHUNK_RETRIES`` attempts).
+           - Attempt 0: original prompt.
+           - Attempt 1+: retry instruction appended; glossary-removal
+             variant used if available.
+        2. ``retry_chatbot`` (1 attempt, if available).
+        3. Binary split: halve the chunk and recurse on each half.
+        4. Atomic fallback for chunks ≤ ``MIN_SPLIT_SIZE``.
+
+        At any point, if ≤ ``ATOMIC_FILL_THRESHOLD`` lines are missing,
+        only the missing lines are filled with atomic translation.
+
+        Returns ``(translations, used_atomic)`` where *used_atomic* is
+        ``True`` if any atomic translation was used (fill or full fallback).
+        """
+        result = self._try_chatbot_attempts(
+            self.chatbot, prompter, user_msg, expected_ids, source_texts,
+            src_lang, target_lang, user_msg_no_glossary,
+        )
+        if result is not None:
+            return result
+
+        # Step 2: retry_chatbot
+        if self.retry_chatbot:
+            logger.info("Primary chatbot exhausted, trying retry chatbot.")
+            result = self._try_single_attempt(
+                self.retry_chatbot, prompter, user_msg, expected_ids, source_texts,
+                src_lang, target_lang,
+            )
+            if result is not None:
+                return result
+
+        # Step 3: binary split (always involves atomic at the leaves)
+        logger.warning("All chatbot retries exhausted, attempting binary-split retry.")
+        translations = self._split_and_translate_lean(
+            prompter, expected_ids, source_texts, src_lang, target_lang,
+            user_msg_no_glossary=user_msg_no_glossary,
+        )
+        return translations, True
+
+    def _try_chatbot_attempts(
+        self,
+        bot: ChatBot,
+        prompter: LeanTranslatePrompter,
+        user_msg: str,
+        expected_ids: list[int],
+        source_texts: dict[int, str],
+        src_lang: str,
+        target_lang: str,
+        user_msg_no_glossary: str | None = None,
+    ) -> tuple[list[str], bool] | None:
+        """Run up to ``MAX_CHUNK_RETRIES`` attempts on *bot*.
+
+        Returns ``(translations, used_atomic)`` or ``None`` if all attempts
+        had >``ATOMIC_FILL_THRESHOLD`` missing lines.
+        """
+        base_messages = [
+            {"role": "system", "content": prompter.system()},
+            {"role": "user", "content": user_msg},
+        ]
+
+        for attempt in range(self.MAX_CHUNK_RETRIES):
+            # Build messages for this attempt.
+            if attempt == 0:
+                messages = base_messages
+            else:
+                # Retry: append retry instruction; use glossary-removal variant if available.
+                retry_user = user_msg_no_glossary if user_msg_no_glossary else user_msg
+                messages = [
+                    {"role": "system", "content": prompter.system()},
+                    {"role": "user", "content": retry_user},
+                    {"role": "user", "content": LEAN_RETRY_INSTRUCTION},
+                ]
+
+            result = self._try_single_attempt(
+                bot, prompter, messages, expected_ids, source_texts, src_lang, target_lang,
+            )
+            if result is not None:
+                return result
+
+            logger.warning(f"Lean chunk attempt {attempt + 1}/{self.MAX_CHUNK_RETRIES} failed.")
+
+        return None
+
+    def _try_single_attempt(
+        self,
+        bot: ChatBot,
+        prompter: LeanTranslatePrompter,
+        messages: str | list[dict],
+        expected_ids: list[int],
+        source_texts: dict[int, str],
+        src_lang: str,
+        target_lang: str,
+    ) -> tuple[list[str], bool] | None:
+        """Execute one LLM call and attempt anchor alignment.
+
+        *messages* is either a pre-built message list or a plain user-msg
+        string (in which case a system+user pair is constructed).
+
+        Returns ``(translations, used_atomic)`` or ``None`` if
+        >``ATOMIC_FILL_THRESHOLD`` lines are missing.
+        """
+        if isinstance(messages, str):
+            messages = [
+                {"role": "system", "content": prompter.system()},
+                {"role": "user", "content": messages},
+            ]
+
+        try:
+            responses = bot.message(messages, output_checker=prompter.check_format)
+            raw = bot.get_content(responses[0])
+        except ChatBotException:
+            logger.error("ChatBot failed for lean chunk.")
+            return None
+
+        if not raw:
+            return None
+
+        parsed = LeanTranslateValidator.parse_anchored_translations(raw)
+        aligned, missing = self._align_translations(expected_ids, parsed)
+        missing_ratio = len(missing) / len(expected_ids) if expected_ids else 0.0
+
+        if missing_ratio == 0:
+            return [t for t in aligned if t is not None], False
+
+        if missing_ratio <= self.ATOMIC_FILL_THRESHOLD:
+            logger.info(
+                f"Anchor alignment: {len(missing)}/{len(expected_ids)} lines missing,"
+                f" filling with atomic translation."
+            )
+            missing_texts = [source_texts[mid] for mid in missing]
+            atomic_results = self.atomic_translate(bot, missing_texts, src_lang, target_lang)
+            atomic_map = dict(zip(missing, atomic_results))
+            return [
+                atomic_map[eid] if t is None else t
+                for eid, t in zip(expected_ids, aligned)
+            ], True
+
+        logger.warning(
+            f"Anchor alignment: {len(missing)}/{len(expected_ids)} lines missing ({missing_ratio:.0%})."
+        )
+        return None
+
+    def _split_and_translate_lean(
+        self,
+        prompter: LeanTranslatePrompter,
+        expected_ids: list[int],
+        source_texts: dict[int, str],
+        src_lang: str,
+        target_lang: str,
+        user_msg_no_glossary: str | None = None,
+    ) -> list[str]:
+        """Binary-split a chunk and translate each half recursively.
+
+        Falls back to atomic translation when a half is ≤ ``MIN_SPLIT_SIZE``.
+        """
+        if len(expected_ids) <= self.MIN_SPLIT_SIZE:
+            if not expected_ids:
+                return []
+            logger.info(
+                f"Chunk below MIN_SPLIT_SIZE ({self.MIN_SPLIT_SIZE}), using atomic translation."
+            )
+            return self.atomic_translate(
+                self.chatbot, [source_texts[eid] for eid in expected_ids], src_lang, target_lang,
+            )
+
+        mid = len(expected_ids) // 2
+        left_ids, right_ids = expected_ids[:mid], expected_ids[mid:]
+        logger.info(f"Splitting chunk into {len(left_ids)}+{len(right_ids)} lines for retry.")
+
+        results: list[str] = []
+        for half_ids in (left_ids, right_ids):
+            half_chunk = [(eid, source_texts[eid]) for eid in half_ids]
+            formatted = prompter.format_texts(half_chunk)
+            half_user_msg = prompter.user(formatted)
+            prompter.update_expected_ids(half_ids)
+
+            half_source = {eid: source_texts[eid] for eid in half_ids}
+
+            # Try primary chatbot
+            result = self._try_single_attempt(
+                self.chatbot, prompter, half_user_msg, half_ids, half_source, src_lang, target_lang,
+            )
+            if result is not None:
+                results.extend(result[0])
+                continue
+
+            # Try retry chatbot
+            if self.retry_chatbot:
+                result = self._try_single_attempt(
+                    self.retry_chatbot, prompter, half_user_msg, half_ids, half_source, src_lang, target_lang,
+                )
+                if result is not None:
+                    results.extend(result[0])
+                    continue
+
+            # Recurse
+            results.extend(
+                self._split_and_translate_lean(
+                    prompter, half_ids, half_source, src_lang, target_lang,
+                    user_msg_no_glossary=None,
+                )
+            )
+
+        return results
+
+    @staticmethod
+    def _extract_cr_context(guideline: str) -> tuple[str, str, str]:
+        """Extract summary, characters, and terminology from a CR guideline.
+
+        Supports both ``### Section:`` (markdown) and ``section:`` (YAML-like)
+        formats produced by :class:`ContextReviewPrompter` and
+        :class:`LeanContextReviewPrompter` respectively.
+
+        Returns ``(summary, characters, terminology)``.  Empty string for
+        any section not found.
+        """
+        # Pattern matches both "### Glossary:" (markdown) and "glossary:" (YAML)
+        # at the start of a line.  Captures everything after the header
+        # (including same-line content like "summary: text here") until the
+        # next section header or end of string.
+        def _extract(section_name: str) -> str:
+            pattern = rf"^(?:###\s*)?{section_name}[:\s]*(.*?)(?=\n(?:###\s*)?\w+[:\s]*(?:\n|$)|\Z)"
+            match = re.search(pattern, guideline, re.DOTALL | re.IGNORECASE | re.MULTILINE)
+            return match.group(1).strip() if match else ""
+
+        summary = _extract("summary")
+        characters = _extract("characters")
+        terminology = _extract("glossary")
+
+        return summary, characters, terminology
+
+
 class LLMTranslator(BaseLLMTranslator):
     """Translator using Large Language Models for translation.
 
@@ -364,9 +867,9 @@ class LLMTranslator(BaseLLMTranslator):
             retry_chatbot=retry_chatbot,
             chunk_size=chunk_size,
             timestamps=timestamps,
+            chunked_guideline=chunked_guideline,
         )
         self.intercept_line = intercept_line
-        self.chunked_guideline = chunked_guideline
         self.use_retry_cnt = 0
 
     @staticmethod

@@ -15,6 +15,7 @@ from openlrc.prompter import (
     ChunkedTranslatePrompter,
     ContextReviewerValidatePrompter,
     ContextReviewPrompter,
+    ContextReviewPrompterBase,
     ProofreaderPrompter,
     TranslationEvaluatorPrompter,
 )
@@ -259,6 +260,7 @@ class ContextReviewerAgent(Agent):
         chatbot: ChatBot,
         retry_chatbot: ChatBot | None = None,
         chunked_guideline: bool = False,
+        prompter: ContextReviewPrompterBase | None = None,
     ):
         """
         Initialize the ContextReviewerAgent.
@@ -272,6 +274,8 @@ class ContextReviewerAgent(Agent):
             chunked_guideline: Enable chunked guideline generation for long texts.
                 When False (default), long texts that exceed the context window will fail.
                 When True, automatically splits into chunks and merges partial guidelines.
+            prompter: Optional prompter instance.  Defaults to
+                :class:`ContextReviewPrompter` when not provided.
         """
         super().__init__()
         if info is None:
@@ -283,7 +287,7 @@ class ContextReviewerAgent(Agent):
         self.chatbot_model = chatbot.model_name
         self.chunked_guideline = chunked_guideline
         self.validate_prompter = ContextReviewerValidatePrompter()
-        self.prompter = ContextReviewPrompter(src_lang, target_lang)
+        self.prompter = prompter or ContextReviewPrompter(src_lang, target_lang)
         self.retry_chatbot = retry_chatbot
 
     def __str__(self):
@@ -304,7 +308,7 @@ class ContextReviewerAgent(Agent):
 
         # Use the content to check first
         lowered_context = context.lower()
-        keywords = ["glossary", "characters", "summary", "tone and style", "target audience"]
+        keywords = self.prompter.expected_sections
         if all(keyword in lowered_context for keyword in keywords):
             return True
 
