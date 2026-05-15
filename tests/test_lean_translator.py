@@ -8,9 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from openlrc.agents import create_chatbot
+from openlrc.media_utils import get_similarity
 from openlrc.prompter import LeanContextReviewPrompter, LeanTranslatePrompter
 from openlrc.translate import LeanTranslator
 from openlrc.validators import LeanTranslateValidator
+from tests.conftest import LIVE_API, TEST_LLM_API_KEY, TEST_MODELS
 
 
 def _make_mock_chatbot(name: str = "gpt-4.1-nano") -> MagicMock:
@@ -643,3 +646,88 @@ class TestLeanTranslatorTranslate(unittest.TestCase):
         # api_fee should include fees from index 3 onward (after the 3 pre-existing entries)
         # The mock_message appends 0.05 each call; at least one call for translation
         self.assertGreater(translator.api_fee, 0)
+
+
+@unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1 and valid API keys")
+class TestLeanTranslatorLive(unittest.TestCase):
+    """Live API tests for LeanTranslator.
+
+    These tests make real LLM API calls and require:
+    - OPENLRC_TEST_LIVE_API=1
+    - OPENLRC_TEST_LLM_API_KEY set to a valid API key
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+
+    def tearDown(self):
+        compare_path = Path("translate_intermediate.json")
+        compare_path.unlink(missing_ok=True)
+
+    def test_single_chunk_no_cr(self):
+        """Basic single-chunk translation without CR."""
+        chatbot = create_chatbot(TEST_MODELS["gemini"])
+        try:
+            translator = LeanTranslator(chatbot=chatbot, enable_cr=False)
+            translations = translator.translate("Hello, how are you?", "en", "es")
+        finally:
+            chatbot.close()
+
+        self.assertEqual(len(translations), 1)
+        self.assertTrue(translations[0].strip())
+        self.assertGreater(get_similarity(translations[0], "Hola, ¿cómo estás?"), 0.5)
+
+    def test_multiple_chunk_no_cr(self):
+        """Multiple chunks without CR, verifying all lines are translated."""
+        texts = ["Hello, how are you?", "I am fine, thank you.", "See you tomorrow.", "Good night."]
+        chatbot = create_chatbot(TEST_MODELS["gemini"])
+        try:
+            translator = LeanTranslator(chatbot=chatbot, enable_cr=False, chunk_size=2)
+            translations = translator.translate(texts, "en", "es")
+        finally:
+            chatbot.close()
+
+        self.assertEqual(len(translations), len(texts))
+        self.assertTrue(all(t.strip() for t in translations))
+
+    def test_with_cr(self):
+        """Full pipeline: CR generates guideline, then translation uses it."""
+        texts = ["The suspect fled to the uptown area.", "Detective John began the investigation."]
+        chatbot = create_chatbot(TEST_MODELS["gemini"])
+        try:
+            translator = LeanTranslator(chatbot=chatbot, enable_cr=True)
+            translations = translator.translate(texts, "en", "zh")
+        finally:
+            chatbot.close()
+
+        self.assertEqual(len(translations), len(texts))
+        self.assertTrue(all(t.strip() for t in translations))
+
+    def test_cr_chatbot_separation(self):
+        """Mixed-model: GPT does CR, Gemini does translation."""
+        texts = ["The suspect fled to the uptown area.", "Detective John began the investigation."]
+        cr_bot = create_chatbot(TEST_MODELS["gpt"])
+        mt_bot = create_chatbot(TEST_MODELS["gemini"])
+        try:
+            translator = LeanTranslator(chatbot=mt_bot, cr_chatbot=cr_bot, enable_cr=True)
+            translations = translator.translate(texts, "en", "zh")
+        finally:
+            cr_bot.close()
+            mt_bot.close()
+
+        self.assertEqual(len(translations), len(texts))
+        self.assertTrue(all(t.strip() for t in translations))
+        self.assertGreater(translator.api_fee, 0)
+
+    def test_empty_texts(self):
+        """Empty input returns empty list without API calls."""
+        chatbot = create_chatbot(TEST_MODELS["gemini"])
+        try:
+            translator = LeanTranslator(chatbot=chatbot, enable_cr=False)
+            translations = translator.translate([], "en", "es")
+        finally:
+            chatbot.close()
+
+        self.assertEqual(translations, [])
