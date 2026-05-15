@@ -478,6 +478,7 @@ class LeanTranslator(BaseLLMTranslator):
 
         cr_fee_start = len(self.cr_chatbot.api_fees) if self.cr_chatbot else 0
         retry_fee_start = len(self.retry_chatbot.api_fees) if self.retry_chatbot else 0
+        fee_start = len(self.chatbot.api_fees)
 
         # Load checkpoint
         translations, compare_list, start_chunk, ctx = self._load_checkpoint(compare_path)
@@ -516,8 +517,6 @@ class LeanTranslator(BaseLLMTranslator):
         # --- Chunk and translate --------------------------------------
         chunks = self.make_chunks_by_tokens(texts)
         logger.info(f"Translating {info.title}: {len(chunks)} chunks, {len(texts)} lines in total.")
-
-        fee_start = len(self.chatbot.api_fees)
 
         for i, chunk in list(enumerate(chunks, start=1))[start_chunk:]:
             expected_ids = [line_id for line_id, _ in chunk]

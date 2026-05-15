@@ -52,6 +52,14 @@ class TranslationConfig:
             ``LRCer`` or ``LLMTranslator`` API instead.
         retry_model: Fallback model name for translation retries, or None.
         is_force_glossary_used: Force glossary usage in context. Default: ``False``
+        translate_mode: Translation strategy. ``"standard"`` uses
+            :class:`LLMTranslator`, ``"lean"`` uses :class:`LeanTranslator`.
+            Default: ``"standard"``
+        cr_model: Separate model for Context Review in lean mode, or None.
+            When None and lean mode is active, the primary ``chatbot_model``
+            is used for CR. Ignored in standard mode.
+        enable_cr: Whether to run Context Review in lean mode.
+            Default: ``True``. Ignored in standard mode.
     """
 
     chatbot_model: str = "gpt-4.1-nano"
@@ -62,3 +70,6 @@ class TranslationConfig:
     glossary: str | None = None
     retry_model: str | None = None
     is_force_glossary_used: bool = False
+    translate_mode: str = "standard"
+    cr_model: str | None = None
+    enable_cr: bool = True

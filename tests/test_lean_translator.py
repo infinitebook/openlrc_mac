@@ -615,3 +615,31 @@ class TestLeanTranslatorTranslate(unittest.TestCase):
 
         call_kwargs = mock_reviewer_cls.call_args
         self.assertIs(call_kwargs.kwargs.get("chatbot") or call_kwargs[1].get("chatbot"), cr_bot)
+
+    @patch("openlrc.translate.ContextReviewerAgent")
+    def test_cr_fee_tracked_when_chatbot_used_for_cr(self, mock_reviewer_cls):
+        """When enable_cr=True and cr_chatbot=None, CR uses chatbot and its fee is tracked."""
+        translator = self._make_translator(enable_cr=True)
+        texts = ["Hello"]
+
+        # Simulate chatbot accumulating fees during CR and translation
+        translator.chatbot.api_fees = [0.0, 0.01, 0.02]  # 3 entries before translate()
+
+        mock_reviewer = mock_reviewer_cls.return_value
+        mock_reviewer.build_context.return_value = "summary:\nA greeting.\n"
+
+        # After CR, chatbot gets one more fee entry; after translation, another
+        def mock_message(msgs, **kwargs):
+            translator.chatbot.api_fees.append(0.05)
+            return [MagicMock()]
+
+        translator.chatbot.message.side_effect = mock_message
+        translator.chatbot.get_content.return_value = "#1\n你好\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            compare_path = Path(tmpdir) / "compare.json"
+            translator.translate(texts, "en", "zh", compare_path=compare_path)
+
+        # api_fee should include fees from index 3 onward (after the 3 pre-existing entries)
+        # The mock_message appends 0.05 each call; at least one call for translation
+        self.assertGreater(translator.api_fee, 0)

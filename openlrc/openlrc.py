@@ -77,6 +77,9 @@ class LRCer:
         glossary: Any = _SENTINEL,
         retry_model: Any = _SENTINEL,
         is_force_glossary_used: Any = _SENTINEL,
+        translate_mode: Any = _SENTINEL,
+        cr_model: Any = _SENTINEL,
+        enable_cr: Any = _SENTINEL,
     ):
 
         # Detect whether any legacy keyword was explicitly passed.
@@ -95,6 +98,9 @@ class LRCer:
             "glossary": glossary,
             "retry_model": retry_model,
             "is_force_glossary_used": is_force_glossary_used,
+            "translate_mode": translate_mode,
+            "cr_model": cr_model,
+            "enable_cr": enable_cr,
         }
         legacy_used = {k: v for k, v in legacy_kwargs.items() if v is not _SENTINEL}
 
@@ -133,6 +139,9 @@ class LRCer:
                     "glossary",
                     "retry_model",
                     "is_force_glossary_used",
+                    "translate_mode",
+                    "cr_model",
+                    "enable_cr",
                 )
             }
             transcription = TranscriptionConfig(**transcription_fields)
@@ -151,6 +160,9 @@ class LRCer:
         self.glossary = self.parse_glossary(self._translation_config.glossary)
         self.retry_model = self._translation_config.retry_model
         self.is_force_glossary_used = self._translation_config.is_force_glossary_used
+        self.translate_mode = self._translation_config.translate_mode
+        self.cr_model = self._translation_config.cr_model
+        self.enable_cr = self._translation_config.enable_cr
 
         self._lock = Lock()
         self.exception = None
@@ -173,6 +185,7 @@ class LRCer:
         self._chatbot_lock = Lock()
         self._chatbot = None
         self._retry_chatbot = None
+        self._cr_chatbot = None
 
     @property
     def transcriber(self):
@@ -218,6 +231,22 @@ class LRCer:
                     )
         return self._retry_chatbot
 
+    @property
+    def cr_chatbot(self):
+        """Lazily initialize and return the CR ChatBot instance (thread-safe).
+
+        Returns None if no cr_model is configured.
+        """
+        if self._cr_chatbot is None and self.cr_model:
+            from openlrc.agents import create_chatbot
+
+            with self._chatbot_lock:
+                if self._cr_chatbot is None:
+                    self._cr_chatbot = create_chatbot(
+                        self.cr_model, self.fee_limit, self.proxy, self.base_url_config
+                    )
+        return self._cr_chatbot
+
     def close(self):
         """Close ChatBot connections and release resources.
 
@@ -229,12 +258,52 @@ class LRCer:
         if self._retry_chatbot is not None:
             self._retry_chatbot.close()
             self._retry_chatbot = None
+        if self._cr_chatbot is not None:
+            self._cr_chatbot.close()
+            self._cr_chatbot = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    def _create_translator(self, timestamps):
+        """Create a Translator instance based on translate_mode."""
+        factories = {
+            "standard": self._create_standard_translator,
+            "lean": self._create_lean_translator,
+        }
+        factory = factories.get(self.translate_mode)
+        if factory is None:
+            raise ValueError(
+                f"Unknown translate_mode: {self.translate_mode!r}. Choose from: {list(factories)}"
+            )
+        return factory(timestamps)
+
+    def _create_standard_translator(self, timestamps):
+        from openlrc.translate import LLMTranslator
+
+        if self.cr_model is not None:
+            logger.warning("cr_model is only used in lean mode, ignoring.")
+        if not self.enable_cr:
+            logger.warning("enable_cr is only used in lean mode, ignoring.")
+        return LLMTranslator(
+            chatbot=self.chatbot,
+            retry_chatbot=self.retry_chatbot,
+            timestamps=timestamps,
+        )
+
+    def _create_lean_translator(self, timestamps):
+        from openlrc.translate import LeanTranslator
+
+        return LeanTranslator(
+            chatbot=self.chatbot,
+            retry_chatbot=self.retry_chatbot,
+            cr_chatbot=self.cr_chatbot,
+            timestamps=timestamps,
+            enable_cr=self.enable_cr,
+        )
 
     @staticmethod
     def parse_glossary(glossary: dict | str | Path | None) -> dict | None:
@@ -572,7 +641,6 @@ class LRCer:
         actual translation, and post-processing of the translated subtitles.
         """
         from openlrc.context import TranslateInfo
-        from openlrc.translate import LLMTranslator
 
         context = TranslateInfo(
             title=audio_name, audio_type="Movie", glossary=self.glossary, forced_glossary=self.is_force_glossary_used
@@ -582,7 +650,7 @@ class LRCer:
         compare_path = Path(translated_path.parent, f"{audio_name}{COMPARE_SUFFIX}.json")
         if not translated_path.exists():
             timestamps = [(seg.start, seg.end) for seg in transcribed_opt_sub.segments]
-            translator = LLMTranslator(chatbot=self.chatbot, retry_chatbot=self.retry_chatbot, timestamps=timestamps)
+            translator = self._create_translator(timestamps)
 
             target_texts = translator.translate(
                 transcribed_opt_sub.texts,
