@@ -27,6 +27,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENLRC_TEST_LLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OPENLRC_TEST_LIVE_API: "1"
       OPENLRC_LOG_LEVEL: "DEBUG"
     steps:

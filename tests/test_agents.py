@@ -14,19 +14,8 @@ from pydantic import BaseModel
 from openlrc.agents import ChunkedTranslatorAgent, ContextReviewerAgent, TranslationContext, create_chatbot
 from openlrc.chatbot import GPTBot
 from openlrc.context import TranslateInfo
-from openlrc.models import ModelConfig, ModelProvider
 from openlrc.prompter import ChunkedTranslatePrompter
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_CHEAP_MODEL = ModelConfig(
-    provider=ModelProvider.OPENAI,
-    name="google/gemini-2.5-flash-lite",
-    base_url=OPENROUTER_BASE_URL,
-    api_key=OPENROUTER_API_KEY,
-)
-LIVE_API = os.environ.get("OPENLRC_TEST_LIVE_API", "").lower() in ("1", "true", "yes")
-STRESS_TEST = os.environ.get("OPENLRC_TEST_STRESS", "").lower() in ("1", "true", "yes")
+from tests.conftest import LIVE_API, STRESS_TEST, TEST_LLM_API_KEY, TEST_MODELS
 
 
 class DummyMessage(BaseModel):
@@ -126,8 +115,8 @@ class TestTranslatorAgent(unittest.TestCase):
 class TestContextReviewerAgent(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
 
     def test_generates_valid_context(self):
         texts = [
@@ -139,7 +128,7 @@ class TestContextReviewerAgent(unittest.TestCase):
         title = "The Detectors"
         glossary = {"suspect": "嫌疑人", "uptown": "市中心"}
 
-        bot = create_chatbot(OPENROUTER_CHEAP_MODEL)
+        bot = create_chatbot(TEST_MODELS["gemini"])
         self.addCleanup(bot.close)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot)
         context = agent.build_context(texts, title, glossary)
@@ -341,8 +330,8 @@ class TestChunkedGuidelineLive(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
         if not LONG_SUBTITLE_PATH.exists():
             raise unittest.SkipTest(f"Test fixture not found: {LONG_SUBTITLE_PATH}")
 
@@ -355,7 +344,7 @@ class TestChunkedGuidelineLive(unittest.TestCase):
 
     def test_baseline_single_pass(self) -> None:
         """Large-window model generates a valid guideline in one pass."""
-        bot = create_chatbot(OPENROUTER_CHEAP_MODEL)
+        bot = create_chatbot(TEST_MODELS["gemini"])
         self.addCleanup(bot.close)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot)
 
@@ -379,7 +368,7 @@ class TestChunkedGuidelineLive(unittest.TestCase):
     @unittest.skipUnless(STRESS_TEST, "Requires OPENLRC_TEST_STRESS=1 (tokenizer mismatch may cause failures on CI)")
     def test_chunked_16k_window(self) -> None:
         """Simulated 16K window triggers ~3 chunks; closest to the real scenario in PR #103."""
-        model = copy(OPENROUTER_CHEAP_MODEL)
+        model = copy(TEST_MODELS["gemini"])
         model.context_window = 16384
         model.max_tokens = 4096
 
@@ -409,7 +398,7 @@ class TestChunkedGuidelineLive(unittest.TestCase):
 
     def test_chunked_8k_window(self) -> None:
         """Simulated 8K window triggers ~6 chunks; merged guideline should be non-empty."""
-        model = copy(OPENROUTER_CHEAP_MODEL)
+        model = copy(TEST_MODELS["gemini"])
         model.context_window = 8192
         model.max_tokens = 2048
 
@@ -462,7 +451,7 @@ class TestChunkedGuidelineLive(unittest.TestCase):
 
     def test_latency_and_reliability(self) -> None:
         """Run chunked generation multiple times and log latency/success statistics."""
-        model = copy(OPENROUTER_CHEAP_MODEL)
+        model = copy(TEST_MODELS["gemini"])
         model.context_window = 8192
         model.max_tokens = 2048
 
@@ -506,7 +495,7 @@ class TestChunkedGuidelineLive(unittest.TestCase):
 
     def test_stress_4k_window(self) -> None:
         """4K window forces ~15 chunks and hierarchical merging; must not crash."""
-        model = copy(OPENROUTER_CHEAP_MODEL)
+        model = copy(TEST_MODELS["gemini"])
         model.context_window = 4096
         model.max_tokens = 1024
 

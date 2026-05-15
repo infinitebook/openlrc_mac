@@ -1,6 +1,5 @@
 #  Copyright (C) 2025. Hao Zheng
 #  All rights reserved.
-import os
 import unittest
 from unittest.mock import patch
 
@@ -9,16 +8,7 @@ import openai
 from pydantic import BaseModel
 
 from openlrc.chatbot import ClaudeBot, GPTBot, route_chatbot
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODELS = {
-    "gpt": "openai/gpt-5-nano",
-    "claude": "anthropic/claude-haiku-4.5",
-    "gemini": "google/gemini-2.5-flash-lite",
-}
-
-LIVE_API = os.environ.get("OPENLRC_TEST_LIVE_API", "").lower() in ("1", "true", "yes")
+from tests.conftest import LIVE_API, TEST_LLM_API_KEY, TEST_LLM_BASE_URL, TEST_MODELS
 
 
 class Usage(BaseModel):
@@ -43,14 +33,14 @@ class OpenAIResponse(BaseModel):
 class TestChatBot(unittest.TestCase):
     def setUp(self):
         self.gpt_bot = GPTBot(
-            model_name=OPENROUTER_MODELS["gpt"],
+            model_name=TEST_MODELS["gpt"].name,
             temperature=1,
             top_p=1,
             retry=8,
             max_async=16,
             fee_limit=0.05,
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY or "test-key",
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY or "test-key",
         )
         self.claude_bot = ClaudeBot(
             model_name="claude-3-5-sonnet-20241022",
@@ -70,8 +60,8 @@ class TestChatBot(unittest.TestCase):
             retry=8,
             max_async=16,
             fee_limit=0.05,
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY,
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY,
         )
 
     def test_estimate_fee(self):
@@ -113,9 +103,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_gpt_message_async(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["gpt"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["gpt"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}], [{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -123,9 +113,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_claude_message_async(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["claude"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["claude"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}], [{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -133,9 +123,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_gpt_message_seq(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["gpt"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["gpt"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -143,9 +133,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_claude_message_seq(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["claude"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["claude"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
         assert "hello" in bot.get_content(results[0]).lower()
@@ -364,12 +354,12 @@ class TestGeminiBot(unittest.TestCase):
     #     os.environ.pop('HTTPS_PROXY')
 
     def test_multi_turn(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
         bot = GPTBot(
-            model_name=OPENROUTER_MODELS["gemini"],
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY,
+            model_name=TEST_MODELS["gemini"].name,
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY,
         )
         result = bot.message(
             [
