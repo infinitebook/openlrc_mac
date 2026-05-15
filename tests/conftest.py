@@ -30,12 +30,15 @@ _MODEL_NAMES = {
     "gemini": os.environ.get("OPENLRC_TEST_MODEL_GEMINI", "google/gemini-2.5-flash-lite"),
 }
 
+_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+
 TEST_MODELS: dict[str, ModelConfig] = {
     key: ModelConfig(
         provider=ModelProvider.OPENAI,
         name=name,
         base_url=TEST_LLM_BASE_URL,
         api_key=TEST_LLM_API_KEY,
+        extra_body=_EXTRA_BODY,
     )
     for key, name in _MODEL_NAMES.items()
 }
