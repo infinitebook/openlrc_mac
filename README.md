@@ -15,71 +15,8 @@ into `.lrc` subtitles with LLMs such as
 - Audio preprocessing to reduce hallucinations (loudness normalization and optional noise suppression).
 - Context-aware translation to improve translation quality.
   Check [prompt](https://github.com/zh-plus/openlrc/blob/master/openlrc/prompter.py) for details.
+- **Lean translation mode** for token-efficient translation with mixed-model support (e.g. cheap MT model + larger CR model).
 - Check [here](#how-it-works) for an overview of the architecture.
-
-## New 🚨
-
-- 2024.5.7:
-    - Added custom endpoint (`base_url`) support for OpenAI and Anthropic:
-        ```python
-        lrcer = LRCer(
-            translation=TranslationConfig(
-                base_url_config={'openai': 'https://api.chatanywhere.tech',
-                                 'anthropic': 'https://example/api'}
-            )
-        )
-        ```
-    - Added bilingual subtitle generation:
-        ```python
-        lrcer.run('./data/test.mp3', target_lang='zh-cn', bilingual_sub=True)
-        ``` 
-- 2024.5.11: Added glossary support in prompts to improve domain-specific translation.
-  Check [here](#glossary) for details.
-- 2024.5.17: You can route models to arbitrary chatbot SDKs (OpenAI or Anthropic) by setting `chatbot_model` to
-  `provider: model_name` together with `base_url_config`:
-    ```python
-    lrcer = LRCer(
-        translation=TranslationConfig(
-            chatbot_model='openai: claude-3-haiku-20240307',
-            base_url_config={'openai': 'https://api.g4f.icu/v1/'}
-        )
-    )
-    ```
-- 2024.6.25: Added Gemini as a translation model (for example, `gemini-1.5-flash`):
-    ```python
-    lrcer = LRCer(translation=TranslationConfig(chatbot_model='gemini-1.5-flash'))
-    ```
-- 2024.9.10: Now openlrc depends on
-  a [specific commit](https://github.com/SYSTRAN/faster-whisper/commit/d57c5b40b06e59ec44240d93485a95799548af50) of
-  faster-whisper, which is not published on PyPI. Install it from source:
-    ```shell
-    pip install "faster-whisper @ https://github.com/SYSTRAN/faster-whisper/archive/8327d8cc647266ed66f6cd878cf97eccface7351.tar.gz"
-    ```
-- 2024.12.19: Added `ModelConfig` for model routing. It is more flexible than plain model-name strings.
-  `TranslationConfig` remains serialization-friendly and string-based; use `ModelConfig`
-  in lower-level programmatic APIs when you need richer routing metadata. `ModelConfig`
-  can be `ModelConfig(provider='<provider>', name='<model-name>', base_url='<url>', proxy='<proxy>')`, e.g.:
-    ```python
-
-    from openlrc import ModelConfig, ModelProvider
-    from openlrc.agents import create_chatbot
-    from openlrc.translate import LLMTranslator
-
-    chatbot_model1 = ModelConfig(
-        provider=ModelProvider.OPENAI, 
-        name='deepseek-chat', 
-        base_url='https://api.deepseek.com/beta', 
-        api_key='sk-APIKEY'
-    )
-    chatbot_model2 = ModelConfig(
-        provider=ModelProvider.OPENAI, 
-        name='gpt-4o-mini', 
-        api_key='sk-APIKEY'
-    )
-    chatbot = create_chatbot(chatbot_model1)
-    retry_chatbot = create_chatbot(chatbot_model2)
-    translator = LLMTranslator(chatbot=chatbot, retry_chatbot=retry_chatbot)
-    ```
 
 ## Installation ⚙️
 
@@ -231,6 +168,26 @@ if __name__ == '__main__':
 
     # Bilingual subtitle
     lrcer.run('./data/test.mp3', target_lang='zh-cn', bilingual_sub=True)
+
+    # Lean translation mode (token-efficient, simplified prompts)
+    lrcer = LRCer(translation=TranslationConfig(translate_mode='lean'))
+    lrcer.run('./data/test.mp3', target_lang='zh-cn')
+
+    # Lean mode with mixed-model architecture (separate CR and translation models)
+    from openlrc.models import ModelConfig, ModelProvider
+    from openlrc.agents import create_chatbot
+    from openlrc.translate import LeanTranslator
+
+    mt_bot = create_chatbot(ModelConfig(
+        provider=ModelProvider.OPENAI, name='your-mt-model',
+        base_url='http://localhost:8000/v1', api_key='token',
+    ))
+    cr_bot = create_chatbot(ModelConfig(
+        provider=ModelProvider.OPENAI, name='your-cr-model',
+        base_url='http://localhost:8001/v1', api_key='token',
+    ))
+    translator = LeanTranslator(chatbot=mt_bot, cr_chatbot=cr_bot, enable_cr=True)
+    translations = translator.translate(['Hello', 'World'], 'en', 'zh')
 ```
 
 `LRCer` supports the context manager protocol, which automatically closes
@@ -352,8 +309,12 @@ uv run pyright openlrc/
 For live translation testing as a developer (and for CI usage), set:
 
 ```shell
-export OPENROUTER_API_KEY="your-openrouter-api-key"
+export OPENLRC_TEST_LLM_API_KEY="your-api-key"
+export OPENLRC_TEST_LIVE_API=1
 ```
+
+See `tests/conftest.py` for all configurable environment variables
+(e.g. `OPENLRC_TEST_LLM_BASE_URL` to point at a local vLLM instance).
 
 ### Build and publish a release
 
@@ -393,9 +354,9 @@ If you prefer GitHub Actions publishing, configure PyPI trusted publishing for t
 - [ ] [Quality]
   Use [multilingual language model](https://www.sbert.net/docs/pretrained_models.html#multi-lingual-models) to assess
   translation quality.
-- [ ] [Efficiency] Add Azure OpenAI Service support.
-- [ ] [Quality] Use [claude](https://www.anthropic.com/index/introducing-claude) for translation.
-- [ ] [Feature] Add local LLM support.
+- [x] [Efficiency] Add Azure OpenAI Service support.
+- [x] [Quality] Use [claude](https://www.anthropic.com/index/introducing-claude) for translation.
+- [x] [Feature] Add local LLM support.
 - [X] [Feature] Multiple translate engine (Anthropic, Microsoft, DeepL, Google, etc.) support.
 - [ ] [**Feature**] Build
   a [electron + fastapi](https://ivanyu2021.hashnode.dev/electron-django-desktop-app-integrate-javascript-and-python)
@@ -404,7 +365,7 @@ If you prefer GitHub Actions publishing, configure PyPI trusted publishing for t
 - [ ] Add [fine-tuned whisper-large-v2](https://huggingface.co/models?search=whisper-large-v2) models for common
   languages.
 - [x] [Feature] Add custom OpenAI & Anthropic endpoint support.
-- [ ] [Feature] Add local translation model support (e.g. [SakuraLLM](https://github.com/SakuraLLM/Sakura-13B-Galgame)).
+- [x] [Feature] Add local translation model support (e.g. [SakuraLLM](https://github.com/SakuraLLM/Sakura-13B-Galgame)).
 - [ ] [Quality] Construct translation quality benchmark test for each patch.
 - [ ] [Quality] Split subtitles using
   LLM ([ref](https://github.com/Huanshere/VideoLingo/blob/ff520309e958dd3048586837d09ce37d3e9ebabd/core/prompts_storage.py#L6)).
