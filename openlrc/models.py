@@ -491,11 +491,24 @@ class Models:
 
         # If no exact match found, try to infer provider from model name
         # Note the model_provider is not vital for next processing
-        if any(name in model_name.lower() for name in ["gpt", "openai", "davinci", "text-", "curie"]):
+        # LiteLLM uses provider/model format -- infer from prefix
+        lower_name = model_name.lower()
+        if lower_name.startswith("openai/"):
             default_model = cls.DefaultOpenAIModelInfo(model_name)
-        elif any(name in model_name.lower() for name in ["claude", "anthropic"]):
+        elif lower_name.startswith("anthropic/"):
             default_model = cls.DefaultAnthropicModelInfo(model_name)
-        elif any(name in model_name.lower() for name in ["gemini", "google", "palm"]):
+        elif lower_name.startswith(("gemini/", "google/")):
+            default_model = cls.DefaultGeminiModelInfo(model_name)
+        elif "/" in model_name and lower_name.split("/")[0] in (
+            "groq", "together_ai", "deepseek", "mistral", "bedrock",
+            "vertex_ai", "azure", "cohere", "fireworks", "replicate",
+        ):
+            default_model = cls.DefaultThirdPartyModelInfo(model_name)
+        elif any(name in lower_name for name in ["gpt", "openai", "davinci", "text-", "curie"]):
+            default_model = cls.DefaultOpenAIModelInfo(model_name)
+        elif any(name in lower_name for name in ["claude", "anthropic"]):
+            default_model = cls.DefaultAnthropicModelInfo(model_name)
+        elif any(name in lower_name for name in ["gemini", "google", "palm"]):
             default_model = cls.DefaultGeminiModelInfo(model_name)
         else:
             default_model = cls.DefaultThirdPartyModelInfo(model_name)
