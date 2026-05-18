@@ -795,6 +795,11 @@ class LiteLLMBot(ChatBot):
         self.api_key = api_key
         self.api_base = (base_url_config or {}).get("litellm")
         self.extra_body = dict(extra_body) if extra_body else {}
+        if proxy:
+            logger.warning(
+                "LiteLLMBot does not support per-instance proxy. "
+                "Set HTTP_PROXY/HTTPS_PROXY environment variables instead."
+            )
 
     def update_fee(self, response):
         usage = getattr(response, "usage", None)
@@ -835,8 +840,7 @@ class LiteLLMBot(ChatBot):
             "max_tokens": self._compute_max_tokens(messages),
             "drop_params": True,
         }
-        if effective_temperature == 1.0:
-            completion_kwargs["top_p"] = effective_top_p
+        completion_kwargs["top_p"] = effective_top_p
         if stop_sequences:
             completion_kwargs["stop"] = stop_sequences
         if self.api_key:
@@ -870,7 +874,12 @@ class LiteLLMBot(ChatBot):
                 break
             except litellm.AuthenticationError as e:
                 raise ChatBotException(f"Authentication failed: {e}") from e
-            except (litellm.BadRequestError, litellm.NotFoundError) as e:
+            except (
+                litellm.BadRequestError,
+                litellm.NotFoundError,
+                litellm.PermissionDeniedError,
+                litellm.UnprocessableEntityError,
+            ) as e:
                 raise ChatBotException(f"Client error: {e}") from e
             except (
                 litellm.RateLimitError,
