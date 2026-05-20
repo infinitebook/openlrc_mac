@@ -67,6 +67,8 @@ def route_chatbot(model: str) -> tuple[type, str]:
             return GPTBot, chatbot_model
         elif chatbot_type == "anthropic":
             return ClaudeBot, chatbot_model
+        elif chatbot_type == "litellm":
+            return LiteLLMBot, chatbot_model
         else:
             raise ValueError(f"Invalid chatbot type {chatbot_type}.")
 
@@ -260,7 +262,6 @@ class GPTBot(ChatBot):
         api_key: str | None = None,
         extra_body: dict | None = None,
     ):
-
         # clamp temperature to 0-2
         temperature = max(0, min(2, temperature))
 
@@ -459,7 +460,6 @@ class ClaudeBot(ChatBot):
         api_key: str | None = None,
         extra_body: dict | None = None,
     ):
-
         # clamp temperature to 0-1
         temperature = max(0, min(1, temperature))
 
@@ -774,4 +774,149 @@ class GeminiBot(ChatBot):
         self.client.close()
 
 
-provider2chatbot = {ModelProvider.OPENAI: GPTBot, ModelProvider.ANTHROPIC: ClaudeBot, ModelProvider.GOOGLE: GeminiBot}
+class LiteLLMBot(ChatBot):
+    """ChatBot backed by the LiteLLM SDK, routing to 100+ LLM providers."""
+
+    def __init__(
+        self,
+        model_name: str = "openai/gpt-4o",
+        temperature: float = 1,
+        top_p: float = 1,
+        retry: int = 8,
+        max_async: int = 16,
+        fee_limit: float = 0.8,
+        proxy: str | None = None,
+        base_url_config: dict | None = None,
+        api_key: str | None = None,
+        extra_body: dict | None = None,
+    ):
+        temperature = max(0, min(2, temperature))
+        super().__init__(model_name, temperature, top_p, retry, max_async, fee_limit)
+        self.api_key = api_key
+        self.api_base = (base_url_config or {}).get("litellm")
+        self.extra_body = dict(extra_body) if extra_body else {}
+        if proxy:
+            logger.warning(
+                "LiteLLMBot does not support per-instance proxy. "
+                "Set HTTP_PROXY/HTTPS_PROXY environment variables instead."
+            )
+
+    def update_fee(self, response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        self.api_fees[-1] += (
+            prompt_tokens * self.model_info.input_price + completion_tokens * self.model_info.output_price
+        ) / 1000000
+
+    def get_content(self, response):
+        content = response.choices[0].message.content
+        return content if content is not None else ""
+
+    def _create_chat(
+        self,
+        messages: list[dict],
+        stop_sequences: list[str] | None = None,
+        output_checker: Callable = lambda user_input, generated_content: True,
+        temperature: float | None = None,
+        top_p: float | None = None,
+    ):
+        try:
+            import litellm
+        except ImportError:
+            raise ImportError(
+                "litellm is required for the litellm: provider. Install with: pip install 'openlrc[litellm]'"
+            )
+
+        effective_temperature = temperature if temperature is not None else self.temperature
+        effective_top_p = top_p if top_p is not None else self.top_p
+
+        completion_kwargs: dict = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": effective_temperature,
+            "max_tokens": self._compute_max_tokens(messages),
+            "drop_params": True,
+        }
+        completion_kwargs["top_p"] = effective_top_p
+        if stop_sequences:
+            completion_kwargs["stop"] = stop_sequences
+        if self.api_key:
+            completion_kwargs["api_key"] = self.api_key
+        if self.api_base:
+            completion_kwargs["api_base"] = self.api_base
+        completion_kwargs.update(self.extra_body)
+
+        response = None
+        validated = False
+        for i in range(self.retry):
+            try:
+                response = litellm.completion(**completion_kwargs)
+                self.update_fee(response)
+
+                if response.choices[0].finish_reason == "length":
+                    usage = getattr(response, "usage", None)
+                    raise LengthExceedException(
+                        prompt_tokens=getattr(usage, "prompt_tokens", -1) if usage else -1,
+                        completion_tokens=getattr(usage, "completion_tokens", -1) if usage else -1,
+                        total_tokens=getattr(usage, "total_tokens", -1) if usage else -1,
+                    )
+
+                response_text = remove_stop(self.get_content(response), stop_sequences)
+
+                if not output_checker(messages[-1]["content"], response_text):
+                    logger.warning(f"Invalid response format. Retry num: {i + 1}.")
+                    continue
+
+                validated = True
+                break
+            except litellm.AuthenticationError as e:
+                raise ChatBotException(f"Authentication failed: {e}") from e
+            except (
+                litellm.BadRequestError,
+                litellm.NotFoundError,
+                litellm.PermissionDeniedError,
+                litellm.UnprocessableEntityError,
+            ) as e:
+                raise ChatBotException(f"Client error: {e}") from e
+            except (
+                litellm.RateLimitError,
+                litellm.APIConnectionError,
+                litellm.InternalServerError,
+                litellm.ServiceUnavailableError,
+                litellm.Timeout,
+                json.decoder.JSONDecodeError,
+            ) as e:
+                sleep_time = self._get_sleep_time(e)
+                logger.warning(f"{type(e).__name__}: {e}. Wait {sleep_time}s before retry. Retry num: {i + 1}.")
+                time.sleep(sleep_time)
+
+        if not response:
+            raise ChatBotException("Failed to create a chat.")
+
+        if not validated:
+            logger.warning("Response format validation failed after all retries, returning best-effort response.")
+
+        return response
+
+    @staticmethod
+    def _get_sleep_time(error):
+        qualname = type(error).__name__
+        if qualname == "RateLimitError":
+            return random.randint(30, 60)
+        elif qualname in ("Timeout", "APIConnectionError"):
+            return 3
+        elif qualname == "JSONDecodeError":
+            return 1
+        else:
+            return 15
+
+
+provider2chatbot = {
+    ModelProvider.OPENAI: GPTBot,
+    ModelProvider.ANTHROPIC: ClaudeBot,
+    ModelProvider.GOOGLE: GeminiBot,
+    ModelProvider.LITELLM: LiteLLMBot,
+}
