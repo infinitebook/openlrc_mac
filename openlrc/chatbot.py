@@ -775,7 +775,14 @@ class GeminiBot(ChatBot):
 
 
 class LiteLLMBot(ChatBot):
-    """ChatBot backed by the LiteLLM SDK, routing to 100+ LLM providers."""
+    """ChatBot backed by the LiteLLM SDK, routing to 100+ LLM providers.
+
+    Note: intentionally not decorated with ``@_register_chatbot`` because
+    ``_register_chatbot`` only maps hardcoded model names by provider enum
+    (OPENAI / ANTHROPIC / GOOGLE) and has no LITELLM clause.  ``LiteLLMBot``
+    is accessed exclusively via the ``"litellm:<model>"`` prefix through
+    ``route_chatbot`` or via ``provider2chatbot[ModelProvider.LITELLM]``.
+    """
 
     def __init__(
         self,
@@ -914,9 +921,10 @@ class LiteLLMBot(ChatBot):
             return 15
 
 
-provider2chatbot = {
+provider2chatbot: dict[str, type[ChatBot]] = {
     ModelProvider.OPENAI: GPTBot,
     ModelProvider.ANTHROPIC: ClaudeBot,
     ModelProvider.GOOGLE: GeminiBot,
+    ModelProvider.THIRD_PARTY: GPTBot,
     ModelProvider.LITELLM: LiteLLMBot,
 }

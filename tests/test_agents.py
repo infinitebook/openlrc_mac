@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from pydantic import BaseModel
 
 from openlrc.agents import ChunkedTranslatorAgent, ContextReviewerAgent, TranslationContext, create_chatbot
-from openlrc.chatbot import GPTBot
+from openlrc.chatbot import ClaudeBot, GPTBot, LiteLLMBot
 from openlrc.context import TranslateInfo
 from openlrc.prompter import ChunkedTranslatePrompter
 from tests.conftest import LIVE_API, STRESS_TEST, TEST_LLM_API_KEY, TEST_MODELS
@@ -73,6 +73,44 @@ class TestTranslatorAgent(unittest.TestCase):
     def test_invalid_chatbot_model(self):
         with self.assertRaises(ValueError):
             create_chatbot("invalid-model")
+
+    def test_create_chatbot_with_model_config(self):
+        from openlrc.models import ModelConfig, ModelProvider
+
+        # OpenAI ModelConfig
+        config_openai = ModelConfig(
+            provider=ModelProvider.OPENAI, name="gpt-4.1-nano", api_key="my-key", proxy="http://proxy"
+        )
+        bot = create_chatbot(config_openai)
+        self.assertEqual(bot.model_name, "gpt-4.1-nano")
+        self.assertEqual(bot.fee_limit, 0.8)
+        self.assertIsInstance(bot, GPTBot)
+
+        # Anthropic ModelConfig
+        config_anthropic = ModelConfig(
+            provider=ModelProvider.ANTHROPIC, name="claude-3-5-sonnet-20241022", api_key="dummy-key"
+        )
+        bot = create_chatbot(config_anthropic)
+        self.assertIsInstance(bot, ClaudeBot)
+
+        # litellm provider string → LiteLLMBot (known provider via ModelProvider coercion)
+        config_litellm = ModelConfig(provider="litellm", name="gpt-4o", api_key="key")
+        bot = create_chatbot(config_litellm)
+        self.assertIsInstance(bot, LiteLLMBot)
+
+        # Unknown custom provider string → falls back to GPTBot
+        config_custom = ModelConfig(provider="openrouter", name="gpt-4o", api_key="key")
+        bot = create_chatbot(config_custom)
+        self.assertIsInstance(bot, GPTBot)
+
+        # ModelConfig with capability overrides
+        config_with_extra = ModelConfig(
+            provider=ModelProvider.OPENAI, name="custom-model", api_key="dummy-key",
+            context_window=65536, max_tokens=4096,
+        )
+        bot = create_chatbot(config_with_extra)
+        self.assertEqual(bot.model_info.context_window, 65536)
+        self.assertEqual(bot.model_info.max_tokens, 4096)
 
     @patch(
         "openlrc.chatbot.GPTBot.get_content",

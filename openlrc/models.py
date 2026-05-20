@@ -1,11 +1,20 @@
 #  Copyright (C) 2025. Hao Zheng
 #  All rights reserved.
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
 
+if sys.version_info >= (3, 11):
+    from enum import StrEnum as _StrEnum
+else:
+    class _StrEnum(str, Enum):
+        """Backport of StrEnum for Python 3.10."""
+        def __str__(self) -> str:
+            return self.value
 
-class ModelProvider(Enum):
+
+class ModelProvider(_StrEnum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GOOGLE = "google"
@@ -25,7 +34,7 @@ class ModelConfig:
     capabilities differ from the defaults.
 
     Attributes:
-        provider (ModelProvider): The provider of the model.
+        provider (ModelProvider | str): The provider of the model.
         name (str): The name of the model.
         base_url (Optional[str]): The base URL for the model API.
         api_key (Optional[str]): The API key for authentication.
@@ -47,8 +56,8 @@ class ModelConfig:
             undefined if such keys are present.
     """
 
-    provider: ModelProvider
-    name: str
+    provider: ModelProvider | str = ModelProvider.OPENAI
+    name: str = "gpt-4.1-nano"
     base_url: str | None = None
     api_key: str | None = None
     proxy: str | None = None
@@ -56,8 +65,17 @@ class ModelConfig:
     max_tokens: int | None = None
     extra_body: dict | None = None
 
+    def __post_init__(self):
+        if isinstance(self.provider, str):
+            try:
+                self.provider = ModelProvider(self.provider.lower())
+            except ValueError:
+                # Custom provider strings remain strings, known ones get coerced
+                pass
+
     def __str__(self):
-        return f"{self.provider.value}:{self.name}"
+        provider_str = self.provider.value if isinstance(self.provider, ModelProvider) else self.provider
+        return f"{provider_str}:{self.name}"
 
 
 @dataclass

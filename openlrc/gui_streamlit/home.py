@@ -12,6 +12,7 @@ from streamlit_extras.mention import mention
 
 from openlrc import LRCer, TranscriptionConfig, TranslationConfig
 from openlrc.gui_streamlit.utils import get_asr_options, get_preprocess_options, get_vad_options, zip_files
+from openlrc.models import ModelConfig, ModelProvider
 
 show_pages([Page("home.py", "Home", "🏠")])
 
@@ -258,6 +259,11 @@ if submitted:
     src_lang = None if src_lang == "Auto Detect" else src_lang
 
     with st.spinner("Running..."):
+        # Resolve provider and API key outside the configuration builder for better readability
+        is_anthropic = chatbot_model.startswith("claude-")
+        bot_provider = ModelProvider.ANTHROPIC if is_anthropic else ModelProvider.OPENAI
+        bot_api_key = (anthropic_api_key if is_anthropic else openai_api_key) or None
+
         lrcer = LRCer(
             transcription=TranscriptionConfig(
                 whisper_model=whisper_model,
@@ -296,7 +302,14 @@ if submitted:
                 preprocess_options=get_preprocess_options(atten_lim_db),
             ),
             translation=TranslationConfig(
-                chatbot_model=chatbot_model, fee_limit=fee_limit, consumer_thread=consumer_thread, proxy=proxy
+                chatbot=ModelConfig(
+                    provider=bot_provider,
+                    name=chatbot_model,
+                    api_key=bot_api_key,
+                    proxy=proxy or None,
+                ),
+                fee_limit=fee_limit,
+                consumer_thread=consumer_thread,
             ),
         )
         results = lrcer.run(

@@ -7,13 +7,12 @@ import concurrent.futures
 import json
 import shutil
 import traceback
-import warnings
 from copy import deepcopy
 from pathlib import Path
 from pprint import pformat
 from queue import Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from faster_whisper.transcribe import Segment
@@ -36,135 +35,42 @@ from openlrc.opt import SubtitleOptimizer
 from openlrc.subtitle import BilingualSubtitle, Subtitle
 from openlrc.utils import Timer, extend_filename, format_timestamp, get_preprocessed_path
 
-_SENTINEL = object()
-
 
 class LRCer:
     """
     Orchestrator for audio/video transcription and translation.
 
-    Preferred usage (config objects)::
+    Usage::
+
+        from openlrc import LRCer
+        from openlrc.config import TranscriptionConfig, TranslationConfig
+        from openlrc.models import ModelConfig, ModelProvider
 
         lrcer = LRCer(
             transcription=TranscriptionConfig(whisper_model='large-v3', device='cuda'),
-            translation=TranslationConfig(chatbot_model='gpt-4.1-nano', fee_limit=1.0),
+            translation=TranslationConfig(
+                chatbot=ModelConfig(provider=ModelProvider.OPENAI, name='gpt-4.1-nano'),
+                fee_limit=1.0,
+            ),
         )
 
-    Legacy keyword arguments are still accepted but deprecated and will be
-    removed in a future release::
-
-        # Deprecated — emits DeprecationWarning
-        lrcer = LRCer(whisper_model='large-v3', chatbot_model='gpt-4.1-nano')
+        # Or with all defaults:
+        lrcer = LRCer()
     """
 
     def __init__(
-        self,
-        *,
-        transcription: TranscriptionConfig | None = None,
-        translation: TranslationConfig | None = None,
-        # Legacy keyword arguments — deprecated
-        whisper_model: Any = _SENTINEL,
-        compute_type: Any = _SENTINEL,
-        device: Any = _SENTINEL,
-        chatbot_model: Any = _SENTINEL,
-        fee_limit: Any = _SENTINEL,
-        consumer_thread: Any = _SENTINEL,
-        asr_options: Any = _SENTINEL,
-        vad_options: Any = _SENTINEL,
-        preprocess_options: Any = _SENTINEL,
-        proxy: Any = _SENTINEL,
-        base_url_config: Any = _SENTINEL,
-        glossary: Any = _SENTINEL,
-        retry_model: Any = _SENTINEL,
-        is_force_glossary_used: Any = _SENTINEL,
-        translate_mode: Any = _SENTINEL,
-        cr_model: Any = _SENTINEL,
-        enable_cr: Any = _SENTINEL,
-        chunked_guideline: Any = _SENTINEL,
+        self, *, transcription: TranscriptionConfig | None = None, translation: TranslationConfig | None = None
     ):
-
-        # Detect whether any legacy keyword was explicitly passed.
-        legacy_kwargs = {
-            "whisper_model": whisper_model,
-            "compute_type": compute_type,
-            "device": device,
-            "chatbot_model": chatbot_model,
-            "fee_limit": fee_limit,
-            "consumer_thread": consumer_thread,
-            "asr_options": asr_options,
-            "vad_options": vad_options,
-            "preprocess_options": preprocess_options,
-            "proxy": proxy,
-            "base_url_config": base_url_config,
-            "glossary": glossary,
-            "retry_model": retry_model,
-            "is_force_glossary_used": is_force_glossary_used,
-            "translate_mode": translate_mode,
-            "cr_model": cr_model,
-            "enable_cr": enable_cr,
-            "chunked_guideline": chunked_guideline,
-        }
-        legacy_used = {k: v for k, v in legacy_kwargs.items() if v is not _SENTINEL}
-
-        if legacy_used:
-            warnings.warn(
-                "Passing keyword arguments directly to LRCer() is deprecated and will be removed in a future "
-                "release. Use TranscriptionConfig / TranslationConfig instead. "
-                "See https://github.com/zh-plus/openlrc/issues/81 for migration details.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        if legacy_used and (transcription is not None or translation is not None):
-            raise ValueError(
-                "Cannot mix legacy keyword arguments with TranscriptionConfig/TranslationConfig. "
-                "Use one style or the other."
-            )
-
-        if legacy_used:
-            # Build config objects from legacy kwargs, using dataclass defaults for unset values.
-            transcription_fields = {
-                k: v
-                for k, v in legacy_used.items()
-                if k in ("whisper_model", "compute_type", "device", "asr_options", "vad_options", "preprocess_options")
-            }
-            translation_fields = {
-                k: v
-                for k, v in legacy_used.items()
-                if k
-                in (
-                    "chatbot_model",
-                    "fee_limit",
-                    "consumer_thread",
-                    "proxy",
-                    "base_url_config",
-                    "glossary",
-                    "retry_model",
-                    "is_force_glossary_used",
-                    "translate_mode",
-                    "cr_model",
-                    "enable_cr",
-                    "chunked_guideline",
-                )
-            }
-            transcription = TranscriptionConfig(**transcription_fields)
-            translation = TranslationConfig(**translation_fields)
-
         self._transcription_config = transcription or TranscriptionConfig()
         self._translation_config = translation or TranslationConfig()
 
         # Translation state
-        self.chatbot_model = self._translation_config.chatbot_model
         self.fee_limit = self._translation_config.fee_limit
         self.api_fee = 0  # Can be updated in different thread, operation should be thread-safe
         self.from_video = set()
-        self.proxy = self._translation_config.proxy
-        self.base_url_config = self._translation_config.base_url_config
         self.glossary = self.parse_glossary(self._translation_config.glossary)
-        self.retry_model = self._translation_config.retry_model
         self.is_force_glossary_used = self._translation_config.is_force_glossary_used
         self.translate_mode = self._translation_config.translate_mode
-        self.cr_model = self._translation_config.cr_model
         self.enable_cr = self._translation_config.enable_cr
         self.chunked_guideline = self._translation_config.chunked_guideline
 
@@ -213,42 +119,42 @@ class LRCer:
         """Lazily initialize and return the primary ChatBot instance (thread-safe)."""
         if self._chatbot is None:
             from openlrc.agents import create_chatbot
+            from openlrc.models import ModelConfig, ModelProvider
 
             with self._chatbot_lock:
                 if self._chatbot is None:
-                    self._chatbot = create_chatbot(self.chatbot_model, self.fee_limit, self.proxy, self.base_url_config)
+                    model_config = self._translation_config.chatbot or ModelConfig(
+                        provider=ModelProvider.OPENAI, name="gpt-4.1-nano"
+                    )
+                    self._chatbot = create_chatbot(model_config, self.fee_limit)
         return self._chatbot
 
     @property
     def retry_chatbot(self):
         """Lazily initialize and return the retry ChatBot instance (thread-safe).
 
-        Returns None if no retry_model is configured.
+        Returns None if no retry_chatbot config is provided.
         """
-        if self._retry_chatbot is None and self.retry_model:
+        if self._retry_chatbot is None and self._translation_config.retry_chatbot:
             from openlrc.agents import create_chatbot
 
             with self._chatbot_lock:
                 if self._retry_chatbot is None:
-                    self._retry_chatbot = create_chatbot(
-                        self.retry_model, self.fee_limit, self.proxy, self.base_url_config
-                    )
+                    self._retry_chatbot = create_chatbot(self._translation_config.retry_chatbot, self.fee_limit)
         return self._retry_chatbot
 
     @property
     def cr_chatbot(self):
         """Lazily initialize and return the CR ChatBot instance (thread-safe).
 
-        Returns None if no cr_model is configured.
+        Returns None if no cr_chatbot config is provided.
         """
-        if self._cr_chatbot is None and self.cr_model:
+        if self._cr_chatbot is None and self._translation_config.cr_chatbot:
             from openlrc.agents import create_chatbot
 
             with self._chatbot_lock:
                 if self._cr_chatbot is None:
-                    self._cr_chatbot = create_chatbot(
-                        self.cr_model, self.fee_limit, self.proxy, self.base_url_config
-                    )
+                    self._cr_chatbot = create_chatbot(self._translation_config.cr_chatbot, self.fee_limit)
         return self._cr_chatbot
 
     def close(self):
@@ -274,15 +180,10 @@ class LRCer:
 
     def _create_translator(self, timestamps):
         """Create a Translator instance based on translate_mode."""
-        factories = {
-            "standard": self._create_standard_translator,
-            "lean": self._create_lean_translator,
-        }
+        factories = {"standard": self._create_standard_translator, "lean": self._create_lean_translator}
         factory = factories.get(self.translate_mode)
         if factory is None:
-            raise ValueError(
-                f"Unknown translate_mode: {self.translate_mode!r}. Choose from: {list(factories)}"
-            )
+            raise ValueError(f"Unknown translate_mode: {self.translate_mode!r}. Choose from: {list(factories)}")
         return factory(timestamps)
 
     def _create_standard_translator(self, timestamps):

@@ -3,7 +3,6 @@
 
 import shutil
 import unittest
-import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -275,89 +274,9 @@ class TestLRCer(unittest.TestCase):
         lrcer.transcribe(self.audio_path)
         self.assertIsNotNone(lrcer._transcriber)
 
-    def test_default_option_merging_parity(self, _mock_chatbot):
-        """Config-based construction should merge default options the same as legacy kwargs."""
-        from openlrc.defaults import default_asr_options
-
-        custom_asr = {"beam_size": 3}
-        custom_vad = {"threshold": 0.7}
-        custom_preprocess = {"atten_lim_db": 20}
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            legacy = LRCer(
-                whisper_model="tiny",
-                device="cpu",
-                compute_type="default",
-                asr_options=custom_asr,
-                vad_options=custom_vad,
-                preprocess_options=custom_preprocess,
-            )
-
-        config_based = LRCer(
-            transcription=TranscriptionConfig(
-                whisper_model="tiny",
-                device="cpu",
-                compute_type="default",
-                asr_options=custom_asr,
-                vad_options=custom_vad,
-                preprocess_options=custom_preprocess,
-            )
-        )
-
-        self.assertEqual(legacy.asr_options, config_based.asr_options)
-        self.assertEqual(legacy.vad_options, config_based.vad_options)
-        self.assertEqual(legacy.preprocess_options, config_based.preprocess_options)
-
-        # Verify custom values are merged on top of defaults
-        self.assertEqual(config_based.asr_options["beam_size"], 3)
-        self.assertEqual(config_based.asr_options["best_of"], default_asr_options["best_of"])
-        self.assertEqual(config_based.vad_options["threshold"], 0.7)
-        self.assertEqual(config_based.preprocess_options["atten_lim_db"], 20)
-
-    def test_legacy_and_config_equivalent_runtime_behavior(self, _mock_chatbot):
-        """Legacy kwargs and config objects should produce equivalent LRCer state."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            legacy = LRCer(
-                whisper_model="tiny",
-                device="cpu",
-                compute_type="default",
-                chatbot_model="gpt-4.1-nano",
-                fee_limit=1.5,
-                consumer_thread=2,
-            )
-
-        config_based = LRCer(
-            transcription=TranscriptionConfig(whisper_model="tiny", device="cpu", compute_type="default"),
-            translation=TranslationConfig(chatbot_model="gpt-4.1-nano", fee_limit=1.5, consumer_thread=2),
-        )
-
-        # Transcription config
-        self.assertEqual(legacy._transcription_config.whisper_model, config_based._transcription_config.whisper_model)
-        self.assertEqual(legacy._transcription_config.device, config_based._transcription_config.device)
-        self.assertEqual(legacy._transcription_config.compute_type, config_based._transcription_config.compute_type)
-
-        # Translation config
-        self.assertEqual(legacy.chatbot_model, config_based.chatbot_model)
-        self.assertEqual(legacy.fee_limit, config_based.fee_limit)
-        self.assertEqual(legacy.consumer_thread, config_based.consumer_thread)
-
-    def test_legacy_kwargs_emit_deprecation_warning(self, _mock_chatbot):
-        """Legacy keyword arguments should emit a DeprecationWarning."""
-        with self.assertWarns(DeprecationWarning):
-            LRCer(whisper_model="tiny", device="cpu", compute_type="default")
-
-    def test_mixing_legacy_and_config_raises_error(self, _mock_chatbot):
-        """Passing both legacy kwargs and config objects should raise ValueError."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            with self.assertRaises(ValueError):
-                LRCer(whisper_model="tiny", transcription=TranscriptionConfig(whisper_model="tiny"))
-
     def test_default_construction_without_arguments(self, _mock_chatbot):
         """LRCer() with no arguments should use default configs."""
         lrcer = LRCer()
         self.assertEqual(lrcer._transcription_config.whisper_model, "large-v3")
-        self.assertEqual(lrcer._translation_config.chatbot_model, "gpt-4.1-nano")
+        self.assertIsNone(lrcer._translation_config.chatbot)
         self.assertIsNone(lrcer._transcriber)
