@@ -3,10 +3,11 @@
 import abc
 import json
 import re
+from typing import Any
 
 from json_repair import repair_json
 
-from openlrc.chatbot import ChatBot, ClaudeBot, GeminiBot, GPTBot, provider2chatbot, route_chatbot
+from openlrc.chatbot import ChatBot, GPTBot, provider2chatbot, route_chatbot
 from openlrc.context import TranslateInfo, TranslationContext
 from openlrc.logger import logger
 from openlrc.models import ModelConfig, ModelProvider
@@ -35,23 +36,27 @@ def create_chatbot(
     (via ``close()`` or a ``with`` statement).
     """
     if isinstance(chatbot_model, str):
-        chatbot_cls: type[ClaudeBot] | type[GPTBot] | type[GeminiBot]
         chatbot_cls, model_name = route_chatbot(chatbot_model)
         return chatbot_cls(
             model_name=model_name, fee_limit=fee_limit, proxy=proxy, retry=4, base_url_config=base_url_config
         )
     elif isinstance(chatbot_model, ModelConfig):
-        chatbot_cls = provider2chatbot[chatbot_model.provider]
+        # Resolve chatbot class: known provider or custom provider (defaults to GPTBot)
+        chatbot_cls: type[Any] = provider2chatbot.get(chatbot_model.provider, GPTBot)
         proxy = chatbot_model.proxy or proxy
 
         if chatbot_model.base_url:
-            if chatbot_model.provider == ModelProvider.OPENAI:
-                base_url_config = {"openai": chatbot_model.base_url}
-            elif chatbot_model.provider == ModelProvider.ANTHROPIC:
+            if chatbot_model.provider == ModelProvider.ANTHROPIC:
                 base_url_config = {"anthropic": chatbot_model.base_url}
-            else:
+            elif chatbot_model.provider == ModelProvider.GOOGLE:
+                logger.warning(
+                    f"Google Gemini SDK does not support custom base_url ({chatbot_model.base_url}), "
+                    f"ignoring. Use system-level proxy if needed."
+                )
                 base_url_config = None
-                logger.warning(f"Unsupported base_url configuration for provider: {chatbot_model.provider}")
+            else:
+                # OpenAI, THIRD_PARTY, and custom string providers all use GPTBot compatibility layer
+                base_url_config = {"openai": chatbot_model.base_url}
 
         bot = chatbot_cls(
             model_name=chatbot_model.name,

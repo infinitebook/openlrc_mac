@@ -46,11 +46,11 @@ class TestLiteLLMBot(unittest.TestCase):
         self.assertEqual(kw["temperature"], 0.5)
 
     @patch("litellm.completion", return_value=_make_response())
-    def test_top_p_omitted_when_temperature_set(self, mock_completion):
+    def test_top_p_default_when_not_set(self, mock_completion):
         bot = _bot(temperature=0.5)
         bot._create_chat([{"role": "user", "content": "test"}])
         kw = mock_completion.call_args.kwargs
-        self.assertNotIn("top_p", kw)
+        self.assertEqual(kw["top_p"], 1.0)
 
     @patch("litellm.completion", return_value=_make_response())
     def test_top_p_included_when_temperature_default(self, mock_completion):
