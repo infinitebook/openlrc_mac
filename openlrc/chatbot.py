@@ -104,27 +104,49 @@ class ChatBot:
 
         self.api_fees = []
 
-    def _compute_max_tokens(self, messages: list[dict]) -> int:
-        """Dynamically compute max_tokens based on input size and model context window.
+    def _compute_max_tokens(self, messages: list[dict], min_tokens: int | None = None) -> int | None:
+        """Return ``max_tokens`` to send to the API, or ``None`` to let the server decide.
 
-        Prevents context window overflow by capping output tokens to the remaining
-        space after input tokens, with a 10% safety margin for tokenizer estimation error.
-        Returns at least 1024 to avoid overly truncated output.
+        When ``model_config`` has ``max_tokens`` set (user opt-in), compute a safe
+        cap that respects the context window and the caller's ``min_tokens`` estimate.
+        When unset (the default), return ``None`` — the API call omits ``max_tokens``
+        and the server uses its own limit.
+
+        When ``min_tokens`` is ``None`` (no caller estimate), the full budget
+        (``model_config.max_tokens`` constrained by context window) is returned.
+        When set, the result is clamped to at most ``min_tokens`` (cost control),
+        with a warning if the estimate exceeds the budget.
         """
+        model_config = getattr(self, 'model_config', None)
+        if model_config is None or model_config.max_tokens is None:
+            return None
+
         input_tokens = get_messages_token_number(messages)
-        context_window = self.model_info.context_window
-        model_max = self.model_info.max_tokens
+        if model_config.context_window is not None:
+            available = int(model_config.context_window * 0.90) - input_tokens
+            upper = min(model_config.max_tokens, available)
+        else:
+            upper = model_config.max_tokens
 
-        available = int(context_window * 0.90) - input_tokens
-        computed = min(model_max, max(available, 1024))
+        if min_tokens is not None:
+            if min_tokens > upper:
+                logger.warning(
+                    f"Estimated output need ({min_tokens}) exceeds generation budget ({upper}). "
+                    f"The translation may be truncated. "
+                    f"(input={input_tokens}, max_tokens={model_config.max_tokens})"
+                )
+            result = min(upper, max(min_tokens, 1024))
+        else:
+            result = upper
 
-        if computed < model_max:
+        if result < model_config.max_tokens:
             logger.debug(
-                f"Dynamic max_tokens: {computed} "
-                f"(input={input_tokens}, context_window={context_window}, model_max={model_max})"
+                f"Dynamic max_tokens: {result} "
+                f"(input={input_tokens}, max_tokens={model_config.max_tokens}, "
+                f"min_tokens={min_tokens})"
             )
 
-        return computed
+        return result
 
     def estimate_fee(self, messages: list[dict]):
         """
@@ -154,6 +176,7 @@ class ChatBot:
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         raise NotImplementedError()
 
@@ -164,6 +187,7 @@ class ChatBot:
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         """
         Send chunked messages to the chatbot.
@@ -174,6 +198,9 @@ class ChatBot:
             output_checker: Callable to validate the generated output.
             temperature: Sampling temperature for this call. Falls back to the instance default if None.
             top_p: Top-p sampling for this call. Falls back to the instance default if None.
+            min_tokens: Estimated output tokens this chunk requires. ``None`` = no estimate,
+                ``_compute_max_tokens`` returns the full budget. When set, used for cost
+                control (``max_tokens`` is clamped to at most this value).
         """
         if not messages_list:
             raise ValueError("Empty message list.")
@@ -208,6 +235,7 @@ class ChatBot:
                         output_checker=output_checker,
                         temperature=temperature,
                         top_p=top_p,
+                        min_tokens=min_tokens,
                     )
                     for message in normalised
                 ]
@@ -339,6 +367,7 @@ class GPTBot(ChatBot):
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         # Check stop sequences
         if stop_sequences and len(stop_sequences) > 4:
@@ -359,6 +388,8 @@ class GPTBot(ChatBot):
             else:
                 passthrough[key] = value
 
+        max_tokens = self._compute_max_tokens(messages, min_tokens=min_tokens)
+
         response = None
         validated = False
         for i in range(self.retry):
@@ -370,9 +401,10 @@ class GPTBot(ChatBot):
                     "top_p": effective_top_p,
                     "response_format": {"type": "json_object" if self.json_mode else "text"},
                     "stop": stop_sequences,
-                    "max_tokens": self._compute_max_tokens(messages),
                     **native_kwargs,
                 }
+                if max_tokens is not None:
+                    create_kwargs["max_tokens"] = max_tokens
                 if passthrough:
                     create_kwargs["extra_body"] = passthrough
 
@@ -472,7 +504,6 @@ class ClaudeBot(ChatBot):
         )
 
         self.model_name = model_name
-        self.max_tokens = self.model_info.max_tokens
         self.extra_body = dict(extra_body) if extra_body else {}
 
     def update_fee(self, response: Message):
@@ -498,11 +529,13 @@ class ClaudeBot(ChatBot):
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         # No need to check stop sequences for Claude (unlimited)
 
         # Compute max_tokens before popping system message from the list.
-        max_tokens = self._compute_max_tokens(messages)
+        # Claude API requires max_tokens; use generous default when no user cap.
+        max_tokens = self._compute_max_tokens(messages, min_tokens=min_tokens) or 8192
 
         # Fall back to instance defaults when not specified per-call.
         effective_temperature = temperature if temperature is not None else self.temperature
@@ -671,6 +704,7 @@ class GeminiBot(ChatBot):
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         # Check stop sequences
         if stop_sequences and len(stop_sequences) > 5:
@@ -706,6 +740,12 @@ class GeminiBot(ChatBot):
             else:
                 logger.debug(f"GeminiBot: ignoring unsupported extra_body key: {key!r}")
 
+        max_output_tokens = self._compute_max_tokens(messages, min_tokens=min_tokens)
+
+        config_kwargs = {}
+        if max_output_tokens is not None:
+            config_kwargs["max_output_tokens"] = max_output_tokens
+
         # Build config per-call so temperature/top_p can vary across callers sharing this bot.
         config = types.GenerateContentConfig(
             temperature=effective_temperature,
@@ -713,6 +753,7 @@ class GeminiBot(ChatBot):
             safety_settings=self.safety_settings,
             stop_sequences=stop_sequences,
             system_instruction=system_msg,
+            **config_kwargs,
             **native_kwargs,
         )
 
@@ -829,6 +870,7 @@ class LiteLLMBot(ChatBot):
         output_checker: Callable = lambda user_input, generated_content: True,
         temperature: float | None = None,
         top_p: float | None = None,
+        min_tokens: int | None = None,
     ):
         try:
             import litellm
@@ -840,13 +882,16 @@ class LiteLLMBot(ChatBot):
         effective_temperature = temperature if temperature is not None else self.temperature
         effective_top_p = top_p if top_p is not None else self.top_p
 
+        max_tokens = self._compute_max_tokens(messages, min_tokens=min_tokens)
+
         completion_kwargs: dict = {
             "model": self.model_name,
             "messages": messages,
             "temperature": effective_temperature,
-            "max_tokens": self._compute_max_tokens(messages),
             "drop_params": True,
         }
+        if max_tokens is not None:
+            completion_kwargs["max_tokens"] = max_tokens
         completion_kwargs["top_p"] = effective_top_p
         if stop_sequences:
             completion_kwargs["stop"] = stop_sequences

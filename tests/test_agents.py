@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from openlrc.agents import ChunkedTranslatorAgent, ContextReviewerAgent, TranslationContext, create_chatbot
 from openlrc.chatbot import ClaudeBot, GPTBot, LiteLLMBot
 from openlrc.context import TranslateInfo
+from openlrc.models import ModelConfig
 from openlrc.prompter import ChunkedTranslatePrompter
 from tests.conftest import LIVE_API, STRESS_TEST, TEST_LLM_API_KEY, TEST_MODELS
 
@@ -109,8 +110,8 @@ class TestTranslatorAgent(unittest.TestCase):
             context_window=65536, max_tokens=4096,
         )
         bot = create_chatbot(config_with_extra)
-        self.assertEqual(bot.model_info.context_window, 65536)
-        self.assertEqual(bot.model_info.max_tokens, 4096)
+        self.assertEqual(bot.model_config.context_window, 65536)
+        self.assertEqual(bot.model_config.max_tokens, 4096)
 
     @patch(
         "openlrc.chatbot.GPTBot.get_content",
@@ -227,9 +228,8 @@ class TestContextReviewerChunking(unittest.TestCase):
         mock_message.return_value = [_make_dummy_response(VALID_GUIDELINE)]
 
         bot = GPTBot(api_key="test-dummy")
+        bot.model_config = ModelConfig(name="test", context_window=100000)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot)
-        # Large context window: no chunking needed.
-        agent.chatbot.model_info.context_window = 100000
         result = agent.build_context(["Hello", "World"], title="Test")
 
         self.assertEqual(mock_message.call_count, 1)
@@ -243,9 +243,8 @@ class TestContextReviewerChunking(unittest.TestCase):
         mock_message.return_value = [_make_dummy_response(MERGED_GUIDELINE)]
 
         bot = GPTBot(api_key="test-dummy")
+        bot.model_config = ModelConfig(name="test", context_window=2500, max_tokens=1024)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot, chunked_guideline=True)
-        agent.chatbot.model_info.context_window = 2500
-        agent.chatbot.model_info.max_tokens = 1024
         texts = [f"Line {i}: Some subtitle text here that is a bit longer." for i in range(200)]
         result = agent.build_context(texts, title="Test")
 
@@ -260,9 +259,8 @@ class TestContextReviewerChunking(unittest.TestCase):
         mock_message.return_value = [_make_dummy_response(VALID_GUIDELINE)]
 
         bot = GPTBot(api_key="test-dummy")
+        bot.model_config = ModelConfig(name="test", context_window=2500, max_tokens=1024)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot)
-        agent.chatbot.model_info.context_window = 2500
-        agent.chatbot.model_info.max_tokens = 1024
         texts = [f"Line {i}: Some subtitle text here that is a bit longer." for i in range(200)]
         result = agent.build_context(texts, title="Test")
 
@@ -285,9 +283,8 @@ class TestContextReviewerChunking(unittest.TestCase):
         mock_message.side_effect = side_effect_fn
 
         bot = GPTBot(api_key="test-dummy")
+        bot.model_config = ModelConfig(name="test", context_window=2500, max_tokens=1024)
         agent = ContextReviewerAgent("en", "zh", chatbot=bot, chunked_guideline=True)
-        agent.chatbot.model_info.context_window = 2500
-        agent.chatbot.model_info.max_tokens = 1024
         texts = [f"Line {i}: Some subtitle text here that is a bit longer." for i in range(200)]
 
         with self.assertRaises(RuntimeError):
