@@ -29,9 +29,9 @@ class ModelConfig:
 
     Combines identity, connection, and capability parameters into a single
     config object.  Capability fields (``context_window``, ``max_tokens``)
-    are optional: when set they override the values from the built-in model
-    registry, which is useful for self-hosted or custom models whose
-    capabilities differ from the defaults.
+    are optional: when set they define output and context-window limits;
+    when ``None`` (the default) the API server's own limits apply, which
+    is the recommended setting for most users.
 
     Attributes:
         provider (ModelProvider | str): The provider of the model.
@@ -40,9 +40,10 @@ class ModelConfig:
         api_key (Optional[str]): The API key for authentication.
         proxy (Optional[str]): The proxy server to use for requests.
         context_window (Optional[int]): Total context window size in tokens.
-            Overrides the built-in default when set.
+            When set, enables context-window safety checks in ``_compute_max_tokens``.
         max_tokens (Optional[int]): Maximum output tokens per request.
-            Overrides the built-in default when set.
+            When set, ``_compute_max_tokens`` caps output at this value;
+            when ``None`` (default), ``max_tokens`` is not sent to the API.
         extra_body (Optional[dict]): Provider-specific parameters passed through
             to the underlying SDK.  Each chatbot subclass extracts the keys it
             recognises (e.g. ``frequency_penalty`` for OpenAI, ``top_k`` for
@@ -84,8 +85,6 @@ class ModelInfo:
     provider: ModelProvider
     input_price: float  # per million tokens
     output_price: float  # per million tokens
-    max_tokens: int
-    context_window: int
     vision_support: bool = False
     knowledge_cutoff: str | None = None
     latest_alias: str | None = None
@@ -99,8 +98,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=15.0,
         output_price=75.0,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
         latest_alias="claude-3-opus-latest",
@@ -111,8 +108,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
     )
@@ -122,8 +117,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=0.25,
         output_price=1.25,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
     )
@@ -133,8 +126,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Apr 2024",
         latest_alias="claude-3-5-sonnet-latest",
@@ -145,8 +136,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Apr 2024",
         latest_alias="claude-3-7-sonnet-latest",
@@ -157,8 +146,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=0.80,
         output_price=4.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=False,
         knowledge_cutoff="July 2024",
         latest_alias="claude-3-5-haiku-latest",
@@ -170,8 +157,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=16384,
-        context_window=128000,
         vision_support=False,
         knowledge_cutoff="Oct 2023",
         latest_alias="gpt-4o",
@@ -182,8 +167,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=5.0,
         output_price=15.0,
-        max_tokens=16384,
-        context_window=128000,
         vision_support=False,
         knowledge_cutoff="Oct 2023",
         latest_alias="gpt-4o-mini",
@@ -194,8 +177,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Dec 2023",
         latest_alias="gpt-4-turbo",
@@ -206,8 +187,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Dec 2023",
         latest_alias="gpt-4-turbo-preview",
@@ -218,8 +197,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Apr 2023",
     )
@@ -229,8 +206,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=30.0,
         output_price=60.0,
-        max_tokens=8192,
-        context_window=8192,
         vision_support=False,
         knowledge_cutoff="Sep 2021",
         latest_alias="gpt-4",
@@ -241,8 +216,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.5,
         output_price=1.5,
-        max_tokens=4096,
-        context_window=16385,
         knowledge_cutoff="Sep 2021",
         latest_alias="gpt-3.5-turbo",
     )
@@ -252,8 +225,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.1,
         output_price=0.4,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -262,8 +233,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.4,
         output_price=1.6,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -272,8 +241,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=2.0,
         output_price=8.0,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -283,8 +250,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=1.25,
         output_price=5.0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
     )
 
@@ -293,8 +258,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0.075,
         output_price=0.30,
-        max_tokens=8192,
-        context_window=1048576,
     )
 
     GEMINI_FLASH_8B = ModelInfo(
@@ -302,8 +265,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0.0375,
         output_price=0.15,
-        max_tokens=8192,
-        context_window=1048576,
     )
 
     GEMINI_2_0_FLASH_LITE = ModelInfo(
@@ -311,8 +272,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -322,8 +281,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -333,8 +290,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -344,8 +299,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -355,8 +308,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Jan 2025",
     )
@@ -367,8 +318,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=4096,
-        context_window=32768,
     )
 
     DEEPSEEK_BETA = ModelInfo(
@@ -376,8 +325,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=32768,
         beta=True,
     )
 
@@ -386,8 +333,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=65536,
         beta=False,
     )
 
@@ -396,8 +341,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=65536,
         beta=False,
     )
 
@@ -410,8 +353,6 @@ class Models:
                 provider=ModelProvider.OPENAI,
                 input_price=10.0,
                 output_price=30.0,
-                max_tokens=16384,
-                context_window=32768,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -426,8 +367,6 @@ class Models:
                 provider=ModelProvider.ANTHROPIC,
                 input_price=8.0,
                 output_price=24.0,
-                max_tokens=4096,
-                context_window=100000,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -442,8 +381,6 @@ class Models:
                 provider=ModelProvider.GOOGLE,
                 input_price=1.0,
                 output_price=3.0,
-                max_tokens=8192,
-                context_window=32768,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -458,8 +395,6 @@ class Models:
                 provider=ModelProvider.LITELLM,
                 input_price=1.0,
                 output_price=1.0,
-                max_tokens=8192,
-                context_window=128000,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -474,8 +409,6 @@ class Models:
                 provider=ModelProvider.THIRD_PARTY,
                 input_price=1.0,
                 output_price=0.2,
-                max_tokens=4096,
-                context_window=32768,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,

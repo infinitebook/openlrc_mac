@@ -14,7 +14,7 @@ import requests
 from openlrc.agents import ChunkedTranslatorAgent, ContextReviewerAgent
 from openlrc.chatbot import ChatBot
 from openlrc.context import TranslateInfo, TranslationContext
-from openlrc.exceptions import ChatBotException
+from openlrc.exceptions import ChatBotException, LengthExceedException
 from openlrc.logger import logger
 from openlrc.prompter import (
     LEAN_RETRY_INSTRUCTION,
@@ -47,6 +47,8 @@ class BaseLLMTranslator(Translator):
     CHUNK_SIZE = 30
     MAX_CHUNK_TOKENS = 1000  # Token budget per chunk (text content only, excludes prompt overhead)
     SCENE_THRESHOLD = 30.0  # Seconds of silence that indicates a scene boundary
+
+    OUTPUT_RATIO: float = 1.0  # Expected output tokens per input token (subclass overrides)
 
     def __init__(
         self,
@@ -218,6 +220,11 @@ class BaseLLMTranslator(Translator):
 
         return best_idx
 
+    def _estimate_output_tokens(self, chunk: list[tuple[int, str]]) -> int:
+        """Estimate how many output tokens this chunk is likely to require."""
+        content_tokens = sum(get_text_token_number(text) for _, text in chunk)
+        return max(1024, int(content_tokens * self.OUTPUT_RATIO))
+
     def atomic_translate(self, chatbot: ChatBot, texts: list[str], src_lang: str, target_lang: str) -> list[str]:
         """
         Perform atomic translation for each text individually.
@@ -352,6 +359,7 @@ class LeanTranslator(BaseLLMTranslator):
     ATOMIC_FILL_THRESHOLD = 0.2  # Missing ≤20% → atomic fill; >20% → full retry
     MAX_CHUNK_RETRIES = 2  # Full-chunk retries before falling back
     MIN_SPLIT_SIZE = 3  # Minimum chunk size for binary-split retry; below this, use atomic
+    OUTPUT_RATIO = 1.5  # Lean: target-only output with safety margin
 
     def __init__(
         self,
@@ -614,12 +622,16 @@ class LeanTranslator(BaseLLMTranslator):
         if result is not None:
             return result
 
+        # Compute min_tokens for retry and fallback paths.
+        chunk_data = [(eid, source_texts[eid]) for eid in expected_ids]
+        min_tokens = self._estimate_output_tokens(chunk_data)
+
         # Step 2: retry_chatbot
         if self.retry_chatbot:
             logger.info("Primary chatbot exhausted, trying retry chatbot.")
             result = self._try_single_attempt(
                 self.retry_chatbot, prompter, user_msg, expected_ids, source_texts,
-                src_lang, target_lang,
+                src_lang, target_lang, min_tokens=min_tokens,
             )
             if result is not None:
                 return result
@@ -653,6 +665,10 @@ class LeanTranslator(BaseLLMTranslator):
             {"role": "user", "content": user_msg},
         ]
 
+        # Compute min_tokens for this chunk.
+        chunk_data = [(eid, source_texts[eid]) for eid in expected_ids]
+        min_tokens = self._estimate_output_tokens(chunk_data)
+
         for attempt in range(self.MAX_CHUNK_RETRIES):
             # Build messages for this attempt.
             if attempt == 0:
@@ -666,9 +682,18 @@ class LeanTranslator(BaseLLMTranslator):
                     {"role": "user", "content": LEAN_RETRY_INSTRUCTION},
                 ]
 
-            result = self._try_single_attempt(
-                bot, prompter, messages, expected_ids, source_texts, src_lang, target_lang,
-            )
+            try:
+                result = self._try_single_attempt(
+                    bot, prompter, messages, expected_ids, source_texts, src_lang, target_lang,
+                    min_tokens=min_tokens,
+                )
+            except LengthExceedException:
+                logger.warning(
+                    f"Lean chunk attempt {attempt + 1}/{self.MAX_CHUNK_RETRIES} failed "
+                    f"due to output length limit — skipping remaining primary retries."
+                )
+                return None  # Same config will also fail on retry; go to fallback.
+
             if result is not None:
                 return result
 
@@ -685,6 +710,7 @@ class LeanTranslator(BaseLLMTranslator):
         source_texts: dict[int, str],
         src_lang: str,
         target_lang: str,
+        min_tokens: int | None = None,
     ) -> tuple[list[str], bool] | None:
         """Execute one LLM call and attempt anchor alignment.
 
@@ -701,8 +727,10 @@ class LeanTranslator(BaseLLMTranslator):
             ]
 
         try:
-            responses = bot.message(messages, output_checker=prompter.check_format)
+            responses = bot.message(messages, output_checker=prompter.check_format, min_tokens=min_tokens)
             raw = bot.get_content(responses[0])
+        except LengthExceedException:
+            raise
         except ChatBotException:
             logger.error("ChatBot failed for lean chunk.")
             return None
@@ -770,20 +798,26 @@ class LeanTranslator(BaseLLMTranslator):
             prompter.update_expected_ids(half_ids)
 
             half_source = {eid: source_texts[eid] for eid in half_ids}
+            min_tokens = self._estimate_output_tokens(half_chunk)
+
+            def _try_bot(bot: ChatBot) -> tuple[list[str], bool] | None:
+                try:
+                    return self._try_single_attempt(
+                        bot, prompter, half_user_msg, half_ids, half_source, src_lang, target_lang,
+                        min_tokens=min_tokens,
+                    )
+                except LengthExceedException:
+                    return None
 
             # Try primary chatbot
-            result = self._try_single_attempt(
-                self.chatbot, prompter, half_user_msg, half_ids, half_source, src_lang, target_lang,
-            )
+            result = _try_bot(self.chatbot)
             if result is not None:
                 results.extend(result[0])
                 continue
 
             # Try retry chatbot
             if self.retry_chatbot:
-                result = self._try_single_attempt(
-                    self.retry_chatbot, prompter, half_user_msg, half_ids, half_source, src_lang, target_lang,
-                )
+                result = _try_bot(self.retry_chatbot)
                 if result is not None:
                     results.extend(result[0])
                     continue
@@ -835,6 +869,7 @@ class LLMTranslator(BaseLLMTranslator):
     RETRY_STREAK = 10  # Number of consecutive chunks to use retry model after a failure
     LINE_MISMATCH_RETRIES = 2  # Max attempts per agent for line-count mismatch recovery
     MIN_SPLIT_SIZE = 3  # Minimum chunk size for binary-split retry; below this, use atomic
+    OUTPUT_RATIO = 2.5  # Standard: source + target output (Original>/Translation> + summary/scene)
 
     def __init__(
         self,

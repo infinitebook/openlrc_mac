@@ -54,6 +54,8 @@ def create_chatbot(
                     f"ignoring. Use system-level proxy if needed."
                 )
                 base_url_config = None
+            elif chatbot_model.provider == ModelProvider.LITELLM:
+                base_url_config = {"litellm": chatbot_model.base_url}
             else:
                 # OpenAI, THIRD_PARTY, and custom string providers all use GPTBot compatibility layer
                 base_url_config = {"openai": chatbot_model.base_url}
@@ -68,16 +70,7 @@ def create_chatbot(
             extra_body=chatbot_model.extra_body,
         )
 
-        # Override model_info with user-specified capability parameters.
-        # Copy first to avoid mutating the shared registry instance.
-        if chatbot_model.context_window is not None or chatbot_model.max_tokens is not None:
-            from copy import copy
-
-            bot.model_info = copy(bot.model_info)
-            if chatbot_model.context_window is not None:
-                bot.model_info.context_window = chatbot_model.context_window
-            if chatbot_model.max_tokens is not None:
-                bot.model_info.max_tokens = chatbot_model.max_tokens
+        bot.model_config = chatbot_model
 
         return bot
     else:
@@ -106,6 +99,7 @@ class ChunkedTranslatorAgent(Agent):
     """
 
     TEMPERATURE = 1.0
+    OUTPUT_RATIO = 2.5  # Source + target output (#id + Original> + Translation>)
 
     def __init__(self, src_lang: str, target_lang: str, info: TranslateInfo | None = None, *, chatbot: ChatBot):
         """
@@ -200,6 +194,11 @@ class ChunkedTranslatorAgent(Agent):
             return [re.sub(r"(<.*?>|</.*?>).*", "", t, flags=re.DOTALL) for t in translations]
         return translations
 
+    def _estimate_output_tokens(self, chunk: list[tuple[int, str]]) -> int:
+        """Estimate how many output tokens this chunk is likely to require."""
+        content_tokens = sum(get_text_token_number(text) for _, text in chunk)
+        return max(1024, int(content_tokens * self.OUTPUT_RATIO))
+
     def translate_chunk(
         self,
         chunk_id: int,
@@ -230,8 +229,10 @@ class ChunkedTranslatorAgent(Agent):
                 "content": self.prompter.user(chunk_id, user_input, context.previous_summaries or "", guideline or ""),
             },
         ]
+        min_tokens = self._estimate_output_tokens(chunk)
         resp = self.chatbot.message(
-            messages_list, output_checker=self.prompter.check_format, temperature=self.TEMPERATURE
+            messages_list, output_checker=self.prompter.check_format, temperature=self.TEMPERATURE,
+            min_tokens=min_tokens,
         )[0]
         translations, summary, scene = self._parse_responses(resp)
         self.cost += self.chatbot.api_fees[-1]
@@ -351,7 +352,8 @@ class ContextReviewerAgent(Agent):
         # Estimate whether the full text fits in a single pass.
         system_tokens = get_text_token_number(self.prompter.system())
         user_tokens = get_text_token_number(self.prompter.user(text_content, title=title, given_glossary=glossary))
-        context_window = self.chatbot.model_info.context_window
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
         available_output = int(context_window * 0.90) - system_tokens - user_tokens
 
         if available_output >= self.MIN_OUTPUT_TOKENS:
@@ -488,7 +490,8 @@ class ContextReviewerAgent(Agent):
         # Calculate max text tokens per chunk: context_window - system - user_overhead - output_reserve.
         system_tokens = get_text_token_number(self.prompter.system())
         user_overhead = get_text_token_number(self.prompter.user("", title=title, given_glossary=glossary))
-        context_window = self.chatbot.model_info.context_window
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
         max_text_tokens = int(context_window * 0.90) - system_tokens - user_overhead - self.MIN_OUTPUT_TOKENS
 
         if max_text_tokens < self.MIN_CHUNK_TEXT_TOKENS:
@@ -550,7 +553,8 @@ class ContextReviewerAgent(Agent):
         groups them into pairs, merges each pair, and recurses until one remains.
         """
         merge_system_tokens = get_text_token_number(self.prompter.merge_system())
-        context_window = self.chatbot.model_info.context_window
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
         max_merge_input = int(context_window * 0.90) - merge_system_tokens - self.MIN_OUTPUT_TOKENS
 
         user_content = self.prompter.merge_user(guidelines, title=title)
