@@ -5,10 +5,14 @@ import json
 import re
 
 from json_repair import repair_json
-from langcodes import Language
+from langcodes import Language as Langcode
+from lingua import Language as LinguaLanguage
 from lingua import LanguageDetectorBuilder
 
+from openlrc.defaults import supported_languages_lingua
 from openlrc.logger import logger
+
+_LINGUA_LANGUAGES = [getattr(LinguaLanguage, name) for name in supported_languages_lingua]
 
 ORIGINAL_PREFIX = "Original>"
 TRANSLATION_PREFIX = "Translation>"
@@ -33,7 +37,7 @@ class BaseValidator(abc.ABC):
 
 class ChunkedTranslateValidator(BaseValidator):
     def __init__(self, target_lang):
-        self.lan_detector = LanguageDetectorBuilder.from_all_languages().build()
+        self.lan_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
         self.target_lang = target_lang
 
     def _extract_translation(self, content: str) -> list[str]:
@@ -64,7 +68,7 @@ class ChunkedTranslateValidator(BaseValidator):
                 return True
             translated_lang = detected_lang.name.lower()
 
-        target_lang = Language.get(self.target_lang).language_name().lower()
+        target_lang = Langcode.get(self.target_lang).language_name().lower()
         if translated_lang != target_lang:
             logger.warning(f"Translated language is {translated_lang}, not {target_lang}.")
             return False
@@ -111,7 +115,7 @@ class ChunkedTranslateValidator(BaseValidator):
 
 class AtomicTranslateValidator(BaseValidator):
     def __init__(self, target_lang):
-        self.lan_detector = LanguageDetectorBuilder.from_all_languages().build()
+        self.lan_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
         self.target_lang = target_lang
 
     def validate(self, user_input, generated_content):
@@ -124,7 +128,7 @@ class AtomicTranslateValidator(BaseValidator):
             return True
 
         translated_lang = detected_lang.name.lower()
-        target_lang = Language.get(self.target_lang).language_name().lower()
+        target_lang = Langcode.get(self.target_lang).language_name().lower()
         if translated_lang != target_lang:
             logger.warning(f'Translated text: "{generated_content}" is {translated_lang}, not {target_lang}.')
             return False
