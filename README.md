@@ -65,6 +65,12 @@ into `.lrc` subtitles with LLMs such as
     pip install 'openlrc[full]'
     ```
 
+   If you want to route translation through LiteLLM, install the LiteLLM extra:
+
+    ```shell
+    pip install 'openlrc[litellm]'
+    ```
+
 ## Lightweight Imports
 
 OpenLRC keeps several package-root APIs lightweight to import.
@@ -120,7 +126,7 @@ Heavy dependencies are loaded only when the corresponding features are first use
 ### Python code
 
 ```python
-from openlrc import LRCer, TranscriptionConfig, TranslationConfig
+from openlrc import LRCer, ModelConfig, ModelProvider, TranscriptionConfig, TranslationConfig
 
 if __name__ == '__main__':
     lrcer = LRCer()
@@ -152,7 +158,9 @@ if __name__ == '__main__':
     lrcer.run('./data/test.mp3', target_lang='zh-cn', noise_suppress=True)
 
     # Change the translation model
-    lrcer = LRCer(translation=TranslationConfig(chatbot_model='claude-3-sonnet-20240229'))
+    lrcer = LRCer(translation=TranslationConfig(
+        chatbot=ModelConfig(provider=ModelProvider.ANTHROPIC, name='claude-3-sonnet-20240229')
+    ))
     lrcer.run('./data/test.mp3', target_lang='zh-cn')
 
     # Clear temp folder after processing done
@@ -161,10 +169,19 @@ if __name__ == '__main__':
     # Use a custom OpenAI-compatible endpoint
     lrcer = LRCer(
         translation=TranslationConfig(
-            chatbot_model='gpt-4.1-nano',
-            base_url_config={'openai': 'https://example.com/v1'}
+            chatbot=ModelConfig(
+                provider=ModelProvider.OPENAI,
+                name='gpt-4.1-nano',
+                base_url='https://example.com/v1',
+                api_key='token',
+            )
         )
     )
+
+    # Route through LiteLLM (requires openlrc[litellm])
+    lrcer = LRCer(translation=TranslationConfig(
+        chatbot=ModelConfig(provider=ModelProvider.LITELLM, name='openai/gpt-4o')
+    ))
 
     # Bilingual subtitle
     lrcer.run('./data/test.mp3', target_lang='zh-cn', bilingual_sub=True)
@@ -174,7 +191,6 @@ if __name__ == '__main__':
     lrcer.run('./data/test.mp3', target_lang='zh-cn')
 
     # Lean mode with mixed-model architecture (separate CR and translation models)
-    from openlrc.models import ModelConfig, ModelProvider
     from openlrc.agents import create_chatbot
     from openlrc.translate import LeanTranslator
 
@@ -335,7 +351,7 @@ uv publish
 # uv publish --token <pypi-token>
 ```
 
-If you prefer GitHub Actions publishing, configure PyPI trusted publishing for this repository and push a version tag such as `v1.6.3`.
+If you prefer GitHub Actions publishing, configure PyPI trusted publishing for this repository and push a version tag such as `v1.7.0a1`.
 
 ## Todo
 

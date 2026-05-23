@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 __all__ = ("LRCer", "TranscriptionConfig", "TranslationConfig", "ModelConfig", "list_chatbot_models", "ModelProvider")
-__version__ = "1.6.3"
+__version__ = "1.7.0a1"
 __author__ = "zh-plus"
 
 _LAZY_EXPORTS = {

@@ -1,3 +1,24 @@
+## 1.7.0a1
+
+Add a token-efficient lean translation pipeline, broaden model-provider routing, and refresh the configuration surface for mixed-model workflows.
+
+### New Features:
+
+- Add `LeanTranslator` with compact anchored prompts, sliding context, checkpoint resume, retry handling, binary-split recovery, and atomic fallback for missing lines.
+- Add lean mode integration to `LRCer` through `TranslationConfig(translate_mode="lean")`, including optional Context Review and separate CR/translation chatbots.
+- Add LiteLLM support as an optional provider gateway via `openlrc[litellm]` and `litellm:<provider/model>` routing.
+- Add `ModelConfig.extra_body` passthrough for provider-specific request parameters across OpenAI-compatible, Anthropic, Gemini, and LiteLLM backends.
+
+### Other Changes:
+
+- Replace legacy string-based translation config fields with `ModelConfig` objects for primary, retry, and Context Review chatbots.
+- Decouple model capability limits from the static model registry; `max_tokens` and `context_window` are now opt-in runtime caps.
+- Improve custom-provider and provider-prefix inference for OpenAI-compatible, Anthropic, Gemini, LiteLLM, and third-party model names.
+- Restrict lingua language detection to the supported language set and add anchor-based validation for lean translation output.
+- Split media helpers from `utils` into `media_utils` to keep heavyweight media dependencies isolated.
+- Centralize live API test configuration, add LeanTranslator and LiteLLM regression coverage, and update CI to exercise the new optional `litellm` extra.
+- Refresh README examples for lean mode, mixed-model translation, live test configuration, and the current local-LLM/provider support status.
+
 ## 1.6.3
 
 Improve translation reliability, reduce heavy import overhead, and tighten release tooling around the `uv` workflow.
