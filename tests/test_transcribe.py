@@ -45,14 +45,14 @@ return_tuple = (
 
 class TestTranscriber(unittest.TestCase):
     def setUp(self) -> None:
-        self.audio_path = Path("data/test_audio.wav")
+        self.audio_path = Path(__file__).parent / "data" / "test_audio.wav"
 
     @patch("openlrc.transcribe.WhisperCLIBackend")
     def test_transcribe_success(self, MockBackend):
         """Test that transcribe() returns valid segments and info."""
         mock_backend_instance = MockBackend.return_value
         mock_backend_instance.transcribe.return_value = {
-            "result": {"language": "en"},
+            "result": {"language": "xx"},
             "transcription": [
                 {
                     "timestamps": {"from": "00:00:00,000", "to": "00:00:03,000"},

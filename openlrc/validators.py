@@ -5,10 +5,14 @@ import json
 import re
 
 from json_repair import repair_json
-from langcodes import Language
+from langcodes import Language as Langcode
+from lingua import Language as LinguaLanguage
 from lingua import LanguageDetectorBuilder
 
+from openlrc.defaults import supported_languages_lingua
 from openlrc.logger import logger
+
+_LINGUA_LANGUAGES = [getattr(LinguaLanguage, name) for name in supported_languages_lingua]
 
 ORIGINAL_PREFIX = "Original>"
 TRANSLATION_PREFIX = "Translation>"
@@ -33,7 +37,7 @@ class BaseValidator(abc.ABC):
 
 class ChunkedTranslateValidator(BaseValidator):
     def __init__(self, target_lang):
-        self.lan_detector = LanguageDetectorBuilder.from_all_languages().build()
+        self.lan_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
         self.target_lang = target_lang
 
     def _extract_translation(self, content: str) -> list[str]:
@@ -64,7 +68,7 @@ class ChunkedTranslateValidator(BaseValidator):
                 return True
             translated_lang = detected_lang.name.lower()
 
-        target_lang = Language.get(self.target_lang).language_name().lower()
+        target_lang = Langcode.get(self.target_lang).language_name().lower()
         if translated_lang != target_lang:
             logger.warning(f"Translated language is {translated_lang}, not {target_lang}.")
             return False
@@ -72,6 +76,10 @@ class ChunkedTranslateValidator(BaseValidator):
         return True
 
     def validate(self, user_input, generated_content):
+        if not generated_content:
+            logger.warning("Empty or None response content.")
+            return False
+
         summary = re.search(r"<summary>(.*)</summary>", generated_content)
         scene = re.search(r"<scene>(.*)</scene>", generated_content)
 
@@ -107,16 +115,20 @@ class ChunkedTranslateValidator(BaseValidator):
 
 class AtomicTranslateValidator(BaseValidator):
     def __init__(self, target_lang):
-        self.lan_detector = LanguageDetectorBuilder.from_all_languages().build()
+        self.lan_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
         self.target_lang = target_lang
 
     def validate(self, user_input, generated_content):
+        if not generated_content:
+            logger.warning("Empty or None response content.")
+            return False
+
         detected_lang = self.lan_detector.detect_language_of(generated_content)
         if not detected_lang:
             return True
 
         translated_lang = detected_lang.name.lower()
-        target_lang = Language.get(self.target_lang).language_name().lower()
+        target_lang = Langcode.get(self.target_lang).language_name().lower()
         if translated_lang != target_lang:
             logger.warning(f'Translated text: "{generated_content}" is {translated_lang}, not {target_lang}.')
             return False
@@ -126,6 +138,10 @@ class AtomicTranslateValidator(BaseValidator):
 
 class ProofreaderValidator(BaseValidator):
     def validate(self, user_input, generated_content):
+        if not generated_content:
+            logger.warning("Empty or None response content.")
+            return False
+
         original = re.findall(ORIGINAL_PREFIX + r"\n(.*?)\n" + TRANSLATION_PREFIX, user_input, re.DOTALL)
         if not original:
             logger.error("Fail to extract original text.")
@@ -161,6 +177,10 @@ class ContextReviewerValidateValidator(BaseValidator):
         Returns:
             bool: True if validation passes, False otherwise.
         """
+        if not generated_content:
+            logger.warning("Empty or None response content.")
+            return False
+
         if re.search(r"\b(?:true|false)\b", generated_content, re.IGNORECASE):
             return True
         else:
@@ -181,3 +201,61 @@ class TranslationEvaluatorValidator(BaseValidator):
                 return False
 
         return True
+
+
+class LeanTranslateValidator(BaseValidator):
+    """Validator for LeanTranslator output.
+
+    Parses ``#<id>`` anchors from the model response and checks that at
+    least ``min_match_ratio`` of the expected line IDs are present.
+    """
+
+    # Matches a line that is exactly ``#<digits>`` (with optional whitespace).
+    _ANCHOR_RE = re.compile(r"^\#(\d+)\s*$", re.MULTILINE)
+
+    def __init__(self, expected_ids: list[int], min_match_ratio: float = 0.8):
+        self.expected_ids = set(expected_ids)
+        self.min_match_ratio = min_match_ratio
+
+    def validate(self, user_input: str, generated_content: str) -> bool:
+        if not generated_content:
+            logger.warning("Empty or None response content.")
+            return False
+
+        parsed = self.parse_anchored_translations(generated_content)
+        if not parsed:
+            logger.warning("No anchored translations found in response.")
+            return False
+
+        matched = self.expected_ids & parsed.keys()
+        ratio = len(matched) / len(self.expected_ids) if self.expected_ids else 0.0
+        if ratio < self.min_match_ratio:
+            logger.warning(
+                f"Anchor match ratio {ratio:.0%} ({len(matched)}/{len(self.expected_ids)})"
+                f" below threshold {self.min_match_ratio:.0%}."
+            )
+            return False
+
+        return True
+
+    @classmethod
+    def parse_anchored_translations(cls, content: str) -> dict[int, str]:
+        """Parse model output into ``{line_id: translation}`` mapping.
+
+        Splits *content* on ``#<digits>`` anchors.  Text between two
+        consecutive anchors (stripped, lines joined with a space) is the
+        translation for the preceding anchor.
+        """
+        parts = cls._ANCHOR_RE.split(content)
+        # parts layout: [preamble, id1, text1, id2, text2, ...]
+        result: dict[int, str] = {}
+        # Start from index 1 (skip preamble), step by 2.
+        for i in range(1, len(parts) - 1, 2):
+            line_id = int(parts[i])
+            raw_text = parts[i + 1].strip()
+            # Join multi-line translations into a single line.
+            translation = " ".join(line.strip() for line in raw_text.splitlines() if line.strip())
+            if translation:
+                result[line_id] = translation
+
+        return result

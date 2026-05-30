@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 from openlrc.defaults import default_whisper_cpp_options
 from openlrc.logger import logger
-from openlrc.utils import Timer, format_timestamp, get_audio_duration, spacy_load
+from openlrc.media_utils import get_audio_duration, spacy_load
+from openlrc.utils import Timer, format_timestamp
 from openlrc.whisper_backend import WhisperCLIBackend
 from openlrc.whisper_types import Segment, Word
 
@@ -363,7 +364,8 @@ class Transcriber:
             Returns:
                 list: List of split segments.
             """
-            assert seg_entry.words is not None, "Segment must have word-level timestamps for splitting"
+            if seg_entry.words is None:
+                raise ValueError("Segment must have word-level timestamps for splitting")
             text = seg_entry.text
             doc = nlp(text)
 
@@ -378,14 +380,10 @@ class Transcriber:
                 former_words.append(word)
                 former_len += len(word.word)
 
-                # Special handling for languages without spaces between words
-                if lang in self.continuous_scripted and former_len >= splittable:
-                    if word.word.startswith(" "):
-                        break
-                    elif word.word.endswith(" "):
-                        former_words.append(word)
-                        former_len += len(word.word)
-                        break
+                # Special handling for languages without spaces between words:
+                # break at the first space boundary once we've accumulated enough text.
+                if lang in self.continuous_scripted and former_len >= splittable and " " in word.word:
+                    break
 
                 # Split at punctuation if possible
                 if former_len >= splittable and is_punct(word.word[-1]):
@@ -427,7 +425,8 @@ class Transcriber:
         id_cnt = 0
         sentences = []  # [{'text': , 'start': , 'end': , 'words': [{word: , start: , end: , score: }, ...]}, ...]
         for segment in segments:
-            assert segment.words is not None, "Segment must have word-level timestamps"
+            if segment.words is None:
+                raise ValueError("Segment must have word-level timestamps")
             # Use pysbd to split the segment text into potential sentences
             splits = [s for s in segmenter.segment(segment.text) if s]  # Also filter out empty splits
             word_start = 0
@@ -479,7 +478,8 @@ class Transcriber:
                         list: List of segments after recursive splitting.
                     """
                     # Check if the segment needs splitting
-                    assert entry.words is not None, "Segment must have word-level timestamps"
+                    if entry.words is None:
+                        raise ValueError("Segment must have word-level timestamps")
                     char_limit = 45 if lang in self.continuous_scripted else 90
                     if len(entry.text) < char_limit or len(entry.words) == 1:
                         if entry.end - entry.start > 10:  # Split if duration > 10s

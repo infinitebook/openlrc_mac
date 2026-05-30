@@ -1,21 +1,14 @@
 #  Copyright (C) 2025. Hao Zheng
 #  All rights reserved.
-import os
 import unittest
+from unittest.mock import patch
 
+import httpx
+import openai
 from pydantic import BaseModel
 
 from openlrc.chatbot import ClaudeBot, GPTBot, route_chatbot
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODELS = {
-    "gpt": "openai/gpt-5-nano",
-    "claude": "anthropic/claude-haiku-4.5",
-    "gemini": "google/gemini-2.5-flash-lite",
-}
-
-LIVE_API = os.environ.get("OPENLRC_TEST_LIVE_API", "").lower() in ("1", "true", "yes")
+from tests.conftest import LIVE_API, TEST_LLM_API_KEY, TEST_LLM_BASE_URL, TEST_MODELS
 
 
 class Usage(BaseModel):
@@ -40,14 +33,14 @@ class OpenAIResponse(BaseModel):
 class TestChatBot(unittest.TestCase):
     def setUp(self):
         self.gpt_bot = GPTBot(
-            model_name=OPENROUTER_MODELS["gpt"],
+            model_name=TEST_MODELS["gpt"].name,
             temperature=1,
             top_p=1,
             retry=8,
             max_async=16,
             fee_limit=0.05,
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY or "test-key",
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY or "test-key",
         )
         self.claude_bot = ClaudeBot(
             model_name="claude-3-5-sonnet-20241022",
@@ -67,8 +60,8 @@ class TestChatBot(unittest.TestCase):
             retry=8,
             max_async=16,
             fee_limit=0.05,
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY,
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY,
         )
 
     def test_estimate_fee(self):
@@ -110,9 +103,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_gpt_message_async(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["gpt"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["gpt"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}], [{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -120,9 +113,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_claude_message_async(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["claude"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["claude"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}], [{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -130,9 +123,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_gpt_message_seq(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["gpt"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["gpt"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
 
@@ -140,9 +133,9 @@ class TestChatBot(unittest.TestCase):
 
     @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1")
     def test_claude_message_seq(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
-        bot = self._make_openrouter_bot(OPENROUTER_MODELS["claude"])
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
+        bot = self._make_openrouter_bot(TEST_MODELS["claude"].name)
         messages_list = [[{"role": "user", "content": "Echo hello:"}]]
         results = bot.message(messages_list)
         assert "hello" in bot.get_content(results[0]).lower()
@@ -182,6 +175,141 @@ class TestChatBot(unittest.TestCase):
         self.assertEqual(chatbot2.temperature, 0)
         self.assertEqual(chatbot3.temperature, 1)
         self.assertEqual(chatbot4.temperature, 0)
+
+    def test_per_call_temperature_overrides_default(self):
+        """message(temperature=X) should override the instance default set in __init__."""
+        bot = GPTBot(model_name="gpt-4.1-nano", temperature=1.0, api_key="test-key")
+
+        # Mock the sync completion call to capture the temperature it receives.
+        captured: list[float | None] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(kwargs.get("temperature"))  # type: ignore[arg-type]
+            raise openai.AuthenticationError(message="test", response=httpx.Response(401), body=None)
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}], temperature=0.3)
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        self.assertEqual(captured[0], 0.3)
+
+    def test_default_temperature_used_when_not_overridden(self):
+        """message() without temperature should use the instance default from __init__."""
+        bot = GPTBot(model_name="gpt-4.1-nano", temperature=0.7, api_key="test-key")
+
+        captured: list[float | None] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(kwargs.get("temperature"))  # type: ignore[arg-type]
+            raise openai.AuthenticationError(message="test", response=httpx.Response(401), body=None)
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}])
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        self.assertEqual(captured[0], 0.7)
+
+
+class TestExtraBody(unittest.TestCase):
+    """Tests for the extra_body passthrough feature (issue #128)."""
+
+    def test_gpt_extra_body_splits_native_and_passthrough(self):
+        """Native keys (frequency_penalty, seed) become top-level kwargs;
+        non-native keys (top_k, chat_template_kwargs) go into extra_body."""
+        bot = GPTBot(
+            model_name="gpt-4.1-nano",
+            api_key="test-key",
+            extra_body={
+                "frequency_penalty": 0.3,
+                "seed": 42,
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        captured: list[dict] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(dict(kwargs))
+            raise openai.AuthenticationError(
+                message="test", response=httpx.Response(401), body=None
+            )
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}])
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        call = captured[0]
+
+        # Native keys should be top-level kwargs
+        self.assertEqual(call["frequency_penalty"], 0.3)
+        self.assertEqual(call["seed"], 42)
+
+        # Non-native keys should be in extra_body
+        self.assertIn("extra_body", call)
+        self.assertEqual(call["extra_body"]["top_k"], 20)
+        self.assertEqual(
+            call["extra_body"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+        # Native keys should NOT be in extra_body
+        self.assertNotIn("frequency_penalty", call["extra_body"])
+        self.assertNotIn("seed", call["extra_body"])
+
+    def test_gpt_no_extra_body_matches_original_behavior(self):
+        """When extra_body is not provided, the API call should not contain
+        extra_body or any extra native kwargs — identical to pre-change behavior."""
+        bot = GPTBot(model_name="gpt-4.1-nano", api_key="test-key")
+
+        captured: list[dict] = []
+
+        def fake_create(**kwargs: object) -> None:
+            captured.append(dict(kwargs))
+            raise openai.AuthenticationError(
+                message="test", response=httpx.Response(401), body=None
+            )
+
+        with patch.object(bot.client.chat.completions, "create", side_effect=fake_create):
+            try:
+                bot.message([{"role": "user", "content": "hi"}])
+            except Exception:
+                pass
+
+        self.assertTrue(len(captured) > 0, "No API call was captured")
+        call = captured[0]
+
+        # No extra_body kwarg should be present
+        self.assertNotIn("extra_body", call)
+
+        # No native extra keys should be present
+        self.assertNotIn("frequency_penalty", call)
+        self.assertNotIn("presence_penalty", call)
+        self.assertNotIn("seed", call)
+
+    def test_extra_body_shallow_copy_isolates_mutations(self):
+        """Mutating the original dict after constructing the bot should not
+        affect the bot's extra_body."""
+        original = {"top_k": 20, "seed": 42}
+        bot = GPTBot(model_name="gpt-4.1-nano", api_key="test-key", extra_body=original)
+
+        # Mutate the original dict
+        original["top_k"] = 999
+        original["new_key"] = "surprise"
+
+        # Bot should still have the original values
+        self.assertEqual(bot.extra_body["top_k"], 20)
+        self.assertEqual(bot.extra_body["seed"], 42)
+        self.assertNotIn("new_key", bot.extra_body)
 
 
 class TestThirdPartyBot(unittest.TestCase):
@@ -226,12 +354,12 @@ class TestGeminiBot(unittest.TestCase):
     #     os.environ.pop('HTTPS_PROXY')
 
     def test_multi_turn(self):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
         bot = GPTBot(
-            model_name=OPENROUTER_MODELS["gemini"],
-            base_url_config={"openai": OPENROUTER_BASE_URL},
-            api_key=OPENROUTER_API_KEY,
+            model_name=TEST_MODELS["gemini"].name,
+            base_url_config={"openai": TEST_LLM_BASE_URL},
+            api_key=TEST_LLM_API_KEY,
         )
         result = bot.message(
             [

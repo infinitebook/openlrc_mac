@@ -1,5 +1,6 @@
 #  Copyright (C) 2024. Hao Zheng
 #  All rights reserved.
+import builtins
 import shutil
 import sys
 import types
@@ -7,9 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from openlrc.preprocess import Preprocessor
+
+TEST_DATA_DIR = Path(__file__).parent / "data"
 
 # Python 3.10's unittest.mock.patch has a bug where @patch("df.enhance.enhance")
 # caches the function object `enhance` as the resolved `df.enhance`, causing
@@ -28,7 +34,7 @@ sys.modules.setdefault("df.enhance", _df_enhance)
 
 class TestPreprocessor(unittest.TestCase):
     def tearDown(self) -> None:
-        preprocessed_path = Path("data/preprocessed")
+        preprocessed_path = TEST_DATA_DIR / "preprocessed"
         shutil.rmtree(preprocessed_path, ignore_errors=True)
 
     @patch.object(_df_enhance, "enhance")
@@ -36,9 +42,11 @@ class TestPreprocessor(unittest.TestCase):
     @patch.object(_df_enhance, "load_audio")
     @patch.object(_df_enhance, "save_audio")
     @patch("openlrc.preprocess.release_memory")
+    @unittest.skipIf(torch is None, "torch is only installed with the full extra")
     def test_noise_suppression_returns_path_objects(
         self, mock_release_memory, mock_save_audio, mock_load_audio, mock_init_df, mock_enhance
     ):
+        assert torch is not None
         chunk_size = 180
         mock_audio_size = chunk_size * 5
 
@@ -59,7 +67,7 @@ class TestPreprocessor(unittest.TestCase):
     @patch("openlrc.preprocess.FFmpegNormalize")
     def test_loudness_normalization_returns_path_objects(self, mock_norm):
         mock_norm.return_value.run_normalization.return_value = None
-        preprocessor = Preprocessor("data/test_audio.wav")
+        preprocessor = Preprocessor(TEST_DATA_DIR / "test_audio.wav")
         ln_paths = preprocessor.loudness_normalization(preprocessor.audio_paths)
         self.assertIsInstance(ln_paths, list)
         self.assertIsInstance(ln_paths[0], Path)
@@ -79,3 +87,16 @@ class TestPreprocessor(unittest.TestCase):
     def test_preprocessor_raises_exception_when_audio_paths_is_not_a_list_or_a_string(self):
         with self.assertRaises(TypeError):
             Preprocessor(123)
+
+    def test_noise_suppression_missing_optional_deps_has_quoted_install_hint(self):
+        original_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "torch":
+                raise ImportError("No module named 'torch'")
+            return original_import(name, globals, locals, fromlist, level)
+
+        preprocessor = Preprocessor("audio.wav")
+        with patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaisesRegex(ImportError, r"pip install 'openlrc\[full\]'"):
+                preprocessor.noise_suppression(preprocessor.audio_paths)

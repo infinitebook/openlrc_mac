@@ -1,3 +1,43 @@
+## 1.7.0a1
+
+Add a token-efficient lean translation pipeline, broaden model-provider routing, and refresh the configuration surface for mixed-model workflows.
+
+### New Features:
+
+- Add `LeanTranslator` with compact anchored prompts, sliding context, checkpoint resume, retry handling, binary-split recovery, and atomic fallback for missing lines.
+- Add lean mode integration to `LRCer` through `TranslationConfig(translate_mode="lean")`, including optional Context Review and separate CR/translation chatbots.
+- Add LiteLLM support as an optional provider gateway via `openlrc[litellm]` and `litellm:<provider/model>` routing.
+- Add `ModelConfig.extra_body` passthrough for provider-specific request parameters across OpenAI-compatible, Anthropic, Gemini, and LiteLLM backends.
+
+### Other Changes:
+
+- Replace legacy string-based translation config fields with `ModelConfig` objects for primary, retry, and Context Review chatbots.
+- Decouple model capability limits from the static model registry; `max_tokens` and `context_window` are now opt-in runtime caps.
+- Improve custom-provider and provider-prefix inference for OpenAI-compatible, Anthropic, Gemini, LiteLLM, and third-party model names.
+- Restrict lingua language detection to the supported language set and add anchor-based validation for lean translation output.
+- Split media helpers from `utils` into `media_utils` to keep heavyweight media dependencies isolated.
+- Centralize live API test configuration, add LeanTranslator and LiteLLM regression coverage, and update CI to exercise the new optional `litellm` extra.
+- Refresh README examples for lean mode, mixed-model translation, live test configuration, and the current local-LLM/provider support status.
+
+## 1.6.3
+
+Improve translation reliability, reduce heavy import overhead, and tighten release tooling around the `uv` workflow.
+
+### New Features:
+
+- Add token-aware, scene-sensitive chunk splitting for long subtitle translation.
+- Add chunked guideline generation for long subtitle files.
+
+### Other Changes:
+
+- Fully defer heavyweight package-root imports and move torch/deepfilternet behind the optional `full` extra.
+- Harden ChatBot and GeminiBot lifecycle handling, retry behavior, and error recovery.
+- Reduce translation log noise and add `OPENLRC_LOG_LEVEL`.
+- Improve line-mismatch retry behavior and raise the default context window to 32K.
+- Replace runtime `assert` checks with explicit exceptions.
+- Fix empty-translation early return, continuous-script duplicate word handling, and lazy import test stdout parsing.
+- Gate long stress tests behind `OPENLRC_TEST_STRESS` and expand chunking/translation coverage.
+
 ## 1.6.2
 
 Refine the transcription and translation pipeline, expand test coverage, and improve the release workflow around `uv`.

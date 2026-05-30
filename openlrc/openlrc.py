@@ -7,147 +7,72 @@ import concurrent.futures
 import json
 import shutil
 import traceback
-import warnings
 from copy import deepcopy
 from pathlib import Path
 from pprint import pformat
 from queue import Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from openlrc.whisper_types import Segment
 
 from openlrc.config import TranscriptionConfig, TranslationConfig
-from openlrc.defaults import default_asr_options, default_preprocess_options, default_vad_options
+from openlrc.defaults import (
+    COMPARE_SUFFIX,
+    NONTRANS_SUFFIX,
+    PREPROCESSED_DIR,
+    PREPROCESSED_SUFFIX,
+    TRANSCRIBED_SUFFIX,
+    TRANSLATED_SUFFIX,
+    default_asr_options,
+    default_preprocess_options,
+    default_vad_options,
+)
 from openlrc.logger import logger
+from openlrc.media_utils import extract_audio, get_audio_duration, get_file_type
 from openlrc.opt import SubtitleOptimizer
 from openlrc.subtitle import BilingualSubtitle, Subtitle
-from openlrc.utils import (
-    Timer,
-    extend_filename,
-    extract_audio,
-    format_timestamp,
-    get_audio_duration,
-    get_file_type,
-    get_preprocessed_path,
-)
-
-_SENTINEL = object()
+from openlrc.utils import Timer, extend_filename, format_timestamp, get_preprocessed_path
 
 
 class LRCer:
     """
     Orchestrator for audio/video transcription and translation.
 
-    Preferred usage (config objects)::
+    Usage::
+
+        from openlrc import LRCer
+        from openlrc.config import TranscriptionConfig, TranslationConfig
+        from openlrc.models import ModelConfig, ModelProvider
 
         lrcer = LRCer(
             transcription=TranscriptionConfig(whisper_model='large-v3', device='cuda'),
-            translation=TranslationConfig(chatbot_model='gpt-4.1-nano', fee_limit=1.0),
+            translation=TranslationConfig(
+                chatbot=ModelConfig(provider=ModelProvider.OPENAI, name='gpt-4.1-nano'),
+                fee_limit=1.0,
+            ),
         )
 
-    Legacy keyword arguments are still accepted but deprecated and will be
-    removed in a future release::
-
-        # Deprecated — emits DeprecationWarning
-        lrcer = LRCer(whisper_model='large-v3', chatbot_model='gpt-4.1-nano')
+        # Or with all defaults:
+        lrcer = LRCer()
     """
 
     def __init__(
-        self,
-        *,
-        transcription: TranscriptionConfig | None = None,
-        translation: TranslationConfig | None = None,
-        # Legacy keyword arguments — deprecated
-        whisper_model: Any = _SENTINEL,
-        compute_type: Any = _SENTINEL,
-        device: Any = _SENTINEL,
-        chatbot_model: Any = _SENTINEL,
-        fee_limit: Any = _SENTINEL,
-        consumer_thread: Any = _SENTINEL,
-        asr_options: Any = _SENTINEL,
-        vad_options: Any = _SENTINEL,
-        preprocess_options: Any = _SENTINEL,
-        proxy: Any = _SENTINEL,
-        base_url_config: Any = _SENTINEL,
-        glossary: Any = _SENTINEL,
-        retry_model: Any = _SENTINEL,
-        is_force_glossary_used: Any = _SENTINEL,
+        self, *, transcription: TranscriptionConfig | None = None, translation: TranslationConfig | None = None
     ):
-
-        # Detect whether any legacy keyword was explicitly passed.
-        legacy_kwargs = {
-            "whisper_model": whisper_model,
-            "compute_type": compute_type,
-            "device": device,
-            "chatbot_model": chatbot_model,
-            "fee_limit": fee_limit,
-            "consumer_thread": consumer_thread,
-            "asr_options": asr_options,
-            "vad_options": vad_options,
-            "preprocess_options": preprocess_options,
-            "proxy": proxy,
-            "base_url_config": base_url_config,
-            "glossary": glossary,
-            "retry_model": retry_model,
-            "is_force_glossary_used": is_force_glossary_used,
-        }
-        legacy_used = {k: v for k, v in legacy_kwargs.items() if v is not _SENTINEL}
-
-        if legacy_used:
-            warnings.warn(
-                "Passing keyword arguments directly to LRCer() is deprecated and will be removed in a future "
-                "release. Use TranscriptionConfig / TranslationConfig instead. "
-                "See https://github.com/zh-plus/openlrc/issues/81 for migration details.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        if legacy_used and (transcription is not None or translation is not None):
-            raise ValueError(
-                "Cannot mix legacy keyword arguments with TranscriptionConfig/TranslationConfig. "
-                "Use one style or the other."
-            )
-
-        if legacy_used:
-            # Build config objects from legacy kwargs, using dataclass defaults for unset values.
-            transcription_fields = {
-                k: v
-                for k, v in legacy_used.items()
-                if k in ("whisper_model", "compute_type", "device", "asr_options", "vad_options", "preprocess_options")
-            }
-            translation_fields = {
-                k: v
-                for k, v in legacy_used.items()
-                if k
-                in (
-                    "chatbot_model",
-                    "fee_limit",
-                    "consumer_thread",
-                    "proxy",
-                    "base_url_config",
-                    "glossary",
-                    "retry_model",
-                    "is_force_glossary_used",
-                )
-            }
-            transcription = TranscriptionConfig(**transcription_fields)
-            translation = TranslationConfig(**translation_fields)
-
         self._transcription_config = transcription or TranscriptionConfig()
         self._translation_config = translation or TranslationConfig()
 
         # Translation state
-        self.chatbot_model = self._translation_config.chatbot_model
         self.fee_limit = self._translation_config.fee_limit
         self.api_fee = 0  # Can be updated in different thread, operation should be thread-safe
         self.from_video = set()
-        self.proxy = self._translation_config.proxy
-        self.base_url_config = self._translation_config.base_url_config
         self.glossary = self.parse_glossary(self._translation_config.glossary)
-        self.retry_model = self._translation_config.retry_model
         self.is_force_glossary_used = self._translation_config.is_force_glossary_used
+        self.translate_mode = self._translation_config.translate_mode
+        self.enable_cr = self._translation_config.enable_cr
+        self.chunked_guideline = self._translation_config.chunked_guideline
 
         self._lock = Lock()
         self.exception = None
@@ -166,6 +91,12 @@ class LRCer:
         self._transcriber = None
         self.transcribed_paths = []
 
+        # Lazy initialization: ChatBot instances are created on first access via properties.
+        self._chatbot_lock = Lock()
+        self._chatbot = None
+        self._retry_chatbot = None
+        self._cr_chatbot = None
+
     @property
     def transcriber(self):
         """Lazily initialize and return the Transcriber instance (thread-safe)."""
@@ -181,6 +112,103 @@ class LRCer:
                         asr_options=self.asr_options,
                     )
         return self._transcriber
+
+    @property
+    def chatbot(self):
+        """Lazily initialize and return the primary ChatBot instance (thread-safe)."""
+        if self._chatbot is None:
+            from openlrc.agents import create_chatbot
+            from openlrc.models import ModelConfig, ModelProvider
+
+            with self._chatbot_lock:
+                if self._chatbot is None:
+                    model_config = self._translation_config.chatbot or ModelConfig(
+                        provider=ModelProvider.OPENAI, name="gpt-4.1-nano"
+                    )
+                    self._chatbot = create_chatbot(model_config, self.fee_limit)
+        return self._chatbot
+
+    @property
+    def retry_chatbot(self):
+        """Lazily initialize and return the retry ChatBot instance (thread-safe).
+
+        Returns None if no retry_chatbot config is provided.
+        """
+        if self._retry_chatbot is None and self._translation_config.retry_chatbot:
+            from openlrc.agents import create_chatbot
+
+            with self._chatbot_lock:
+                if self._retry_chatbot is None:
+                    self._retry_chatbot = create_chatbot(self._translation_config.retry_chatbot, self.fee_limit)
+        return self._retry_chatbot
+
+    @property
+    def cr_chatbot(self):
+        """Lazily initialize and return the CR ChatBot instance (thread-safe).
+
+        Returns None if no cr_chatbot config is provided.
+        """
+        if self._cr_chatbot is None and self._translation_config.cr_chatbot:
+            from openlrc.agents import create_chatbot
+
+            with self._chatbot_lock:
+                if self._cr_chatbot is None:
+                    self._cr_chatbot = create_chatbot(self._translation_config.cr_chatbot, self.fee_limit)
+        return self._cr_chatbot
+
+    def close(self):
+        """Close ChatBot connections and release resources.
+
+        Safe to call multiple times or before any ChatBot has been created.
+        """
+        if self._chatbot is not None:
+            self._chatbot.close()
+            self._chatbot = None
+        if self._retry_chatbot is not None:
+            self._retry_chatbot.close()
+            self._retry_chatbot = None
+        if self._cr_chatbot is not None:
+            self._cr_chatbot.close()
+            self._cr_chatbot = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def _create_translator(self, timestamps):
+        """Create a Translator instance based on translate_mode."""
+        factories = {"standard": self._create_standard_translator, "lean": self._create_lean_translator}
+        factory = factories.get(self.translate_mode)
+        if factory is None:
+            raise ValueError(f"Unknown translate_mode: {self.translate_mode!r}. Choose from: {list(factories)}")
+        return factory(timestamps)
+
+    def _create_standard_translator(self, timestamps):
+        from openlrc.translate import LLMTranslator
+
+        if not self.enable_cr:
+            logger.warning("enable_cr is only used in lean mode, ignoring.")
+        return LLMTranslator(
+            chatbot=self.chatbot,
+            retry_chatbot=self.retry_chatbot,
+            cr_chatbot=self.cr_chatbot,
+            timestamps=timestamps,
+            chunked_guideline=self.chunked_guideline,
+        )
+
+    def _create_lean_translator(self, timestamps):
+        from openlrc.translate import LeanTranslator
+
+        return LeanTranslator(
+            chatbot=self.chatbot,
+            retry_chatbot=self.retry_chatbot,
+            cr_chatbot=self.cr_chatbot,
+            timestamps=timestamps,
+            enable_cr=self.enable_cr,
+            chunked_guideline=self.chunked_guideline,
+        )
 
     @staticmethod
     def parse_glossary(glossary: dict | str | Path | None) -> dict | None:
@@ -213,7 +241,7 @@ class LRCer:
         Returns:
             Path: Path to the transcribed JSON file.
         """
-        transcribed_path = extend_filename(audio_path, "_transcribed").with_suffix(".json")
+        transcribed_path = extend_filename(audio_path, TRANSCRIBED_SUFFIX).with_suffix(".json")
         if not transcribed_path.exists():
             with Timer("Transcription process"):
                 logger.info(
@@ -296,7 +324,7 @@ class LRCer:
     @staticmethod
     def _get_base_name(transcribed_path: Path) -> str:
         """Extract the original audio base name from a transcribed JSON path."""
-        return transcribed_path.stem.replace("_preprocessed_transcribed", "")
+        return transcribed_path.stem.replace(f"{PREPROCESSED_SUFFIX}{TRANSCRIBED_SUFFIX}", "")
 
     def _is_video_transcription(self, transcribed_path: Path, base_name: str) -> bool:
         """
@@ -329,7 +357,7 @@ class LRCer:
         Returns:
             Subtitle: The final subtitle (translated or copied), or None on error.
         """
-        translated_path = extend_filename(transcribed_opt_sub.filename, "_translated")
+        translated_path = extend_filename(transcribed_opt_sub.filename, TRANSLATED_SUFFIX)
         final_json_path = translated_path.with_name(f"{base_name}.json")
 
         if final_json_path.exists():
@@ -382,7 +410,9 @@ class LRCer:
         optimizer = SubtitleOptimizer(non_translated_subtitle)
         optimizer.extend_time()
         non_translated_path = getattr(non_translated_subtitle, f"to_{subtitle_format}")()
-        shutil.move(non_translated_path, non_translated_path.parent.parent / f"{base_name}_nontrans.{subtitle_format}")
+        shutil.move(
+            non_translated_path, non_translated_path.parent.parent / f"{base_name}{NONTRANS_SUFFIX}.{subtitle_format}"
+        )
 
     def _process_transcribed_file(
         self, transcribed_path: Path, target_lang: str | None, skip_trans: bool = False, bilingual_sub: bool = False
@@ -516,23 +546,16 @@ class LRCer:
         actual translation, and post-processing of the translated subtitles.
         """
         from openlrc.context import TranslateInfo
-        from openlrc.translate import LLMTranslator
 
         context = TranslateInfo(
             title=audio_name, audio_type="Movie", glossary=self.glossary, forced_glossary=self.is_force_glossary_used
         )
 
         json_filename = Path(translated_path.parent / (audio_name + ".json"))
-        compare_path = Path(translated_path.parent, f"{audio_name}_compare.json")
+        compare_path = Path(translated_path.parent, f"{audio_name}{COMPARE_SUFFIX}.json")
         if not translated_path.exists():
-            # Translate the transcribed json
-            translator = LLMTranslator(
-                chatbot_model=self.chatbot_model,
-                fee_limit=self.fee_limit,
-                proxy=self.proxy,
-                base_url_config=self.base_url_config,
-                retry_model=self.retry_model,
-            )
+            timestamps = [(seg.start, seg.end) for seg in transcribed_opt_sub.segments]
+            translator = self._create_translator(timestamps)
 
             target_texts = translator.translate(
                 transcribed_opt_sub.texts,
@@ -696,7 +719,8 @@ class LRCer:
         """
         temp_folders = {path.parent for path in paths}
         for folder in temp_folders:
-            assert folder.name == "preprocessed", f"Not a temporary folder: {folder}"
+            if folder.name != PREPROCESSED_DIR:
+                raise ValueError(f"Not a temporary folder: {folder}")
 
             shutil.rmtree(folder)
             logger.debug(f"Removed {folder}")

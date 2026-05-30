@@ -4,18 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openlrc"
-version = "1.6.2"
+version = "1.7.0a1"
 description = "Transcribe (whisper) and translate (gpt) voice into LRC file."
 authors = [{ name = "Hao Zheng", email = "zhenghaosustc@gmail.com" }]
-requires-python = ">=3.9, <3.13"
+requires-python = ">=3.10, <3.13"
 readme = "README.md"
 license = "MIT"
-keywords = [
-    "openai-gpt3",
-    "whisper",
-    "voice transcribe",
-    "lrc",
-]
+keywords = ["openai-gpt3", "whisper", "voice transcribe", "lrc"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Intended Audience :: Developers",
@@ -24,57 +19,53 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "openai>=1.55.0,<2",
-    "anthropic>=0.39.0,<0.40",
+    "openai>=2.20.0",
+    "anthropic>=0.90.0",
     "tiktoken>=0.8.0,<0.9",
     "langcodes>=3.3.0,<4",
     "language-data~=1.1",
     "tqdm>=4.65.0,<5",
     "audioread>=3.0.0,<4",
     "zhconv>=1.4.3,<2",
-    "punctuators>=0.0.5,<0.0.6",
     "colorlog>=6.7.0,<7",
     "ffmpeg-python>=0.2.0,<0.3",
     "lingua-language-detector>=1.3.2,<2",
-    "pandas>=2.0.2,<3",
     "filetype>=1.2.0,<2",
     "jaconvV2>=0.4,<0.5",
     "spacy>=3.8.5,<4",
     "pysbd>=0.3.4,<0.4",
-    "soundfile>=0.12.1,<0.13",
     "ffmpeg-normalize>=1.27.5,<2",
-    "deepfilternet>=0.5.6,<0.6",
-    "aiohttp>=3.9.4,<4",
-    "google-genai==1.11.0",
+    "google-genai>=1.70.0",
     "json_repair==0.25.2",
-    "matplotlib>=3.9.2,<4",
-    "typing-extensions>=4.12.2,<5",
     "onnxruntime>=1.20.0,<1.24; python_version < '3.11'",
     "onnxruntime>=1.20.0,<2; python_version >= '3.11'",
+    "pip>=25.1",
+]
+
+[project.optional-dependencies]
+# Noise suppression via DeepFilterNet (requires torch).
+# Install with: pip install openlrc[full]
+# Only needed when using noise_suppress=True in LRCer.run() or Preprocessor.run().
+full = [
     "torch>=2.6.0",
-    "torchvision>=0.21.0",
     "torchaudio>=2.0.0",
-    "pip>=25.1"
+    "deepfilternet>=0.5.6,<0.6",
+]
+litellm = [
+    "litellm>=1.60,<1.85",
 ]
 
 [project.urls]
-Homepage = "https://github.com/zh-plus/Open-Lyrics"
+Homepage = "https://github.com/zh-plus/openlrc"
 "Documentation" = "https://zh-plus.github.io/openlrc/#/"
-"Changelog" = "https://github.com/zh-plus/Open-Lyrics/blob/master/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/zh-plus/Open-Lyrics/issues"
+"Changelog" = "https://github.com/zh-plus/openlrc/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/zh-plus/openlrc/issues"
 
 [project.scripts]
 openlrc = "openlrc.cli:main"
 
-[virtualenvs]
-create = true
-in-project = true
-
 [dependency-groups]
-dev = [
-    "pyright>=1.1",
-    "ruff>=0.11",
-]
+dev = ["pyright>=1.1", "ruff>=0.11"]
 
 [tool.uv]
 
@@ -82,6 +73,19 @@ dev = [
 name = "PyPI"
 url = "https://pypi.org/simple/"
 default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [tool.ruff]
 target-version = "py310"
@@ -93,7 +97,7 @@ skip-magic-trailing-comma = true
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 ignore = [
-    "E501",   # line too long — handled by formatter
+    "E501", # line too long — handled by formatter
 ]
 
 [tool.ruff.lint.isort]
@@ -105,21 +109,9 @@ pythonVersion = "3.10"
 exclude = ["openlrc/gui_streamlit"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-    "openlrc",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE",
-    "pyproject.toml",
-]
-exclude = [
-    "openlrc/gui",
-    "openlrc/gui_streamlit",
-]
+include = ["openlrc", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+exclude = ["openlrc/gui", "openlrc/gui_streamlit"]
 
 [tool.hatch.build.targets.wheel]
 include = ["openlrc"]
-exclude = [
-    "openlrc/gui",
-    "openlrc/gui_streamlit",
-]
+exclude = ["openlrc/gui", "openlrc/gui_streamlit"]

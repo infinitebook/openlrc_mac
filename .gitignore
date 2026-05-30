@@ -7,3 +7,4 @@ run.py
 /openfaker.egg-info/
 __pycache__/
 uv.lock
+.DS_Store

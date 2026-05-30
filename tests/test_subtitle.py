@@ -2,13 +2,16 @@
 #  All rights reserved.
 
 import unittest
+from pathlib import Path
 
 from openlrc.subtitle import Subtitle
+
+TEST_DATA_DIR = Path(__file__).parent / "data"
 
 
 class TestSubtitle(unittest.TestCase):
     def setUp(self) -> None:
-        self.subtitle = Subtitle.from_json("data/test_valid_subtitle.json")
+        self.subtitle = Subtitle.from_json(TEST_DATA_DIR / "test_valid_subtitle.json")
 
     def check_content(self, subtitle, length=10):
         self.assertEqual(subtitle.lang, "zh")
@@ -24,13 +27,14 @@ class TestSubtitle(unittest.TestCase):
         self.check_content(self.subtitle)
 
     def test_load_lrc(self):
-        subtitle = Subtitle.from_file("data/test_subtitle.lrc")
+        subtitle = Subtitle.from_file(TEST_DATA_DIR / "test_subtitle.lrc")
         self.check_content(subtitle, length=7)
 
     def test_save_json(self):
         subtitle = self.subtitle
-        subtitle.save("data/saved.json")
-        loaded_subtitle = Subtitle.from_file("data/saved.json")
+        output_path = TEST_DATA_DIR / "saved.json"
+        subtitle.save(output_path)
+        loaded_subtitle = Subtitle.from_file(output_path)
         self.check_content(loaded_subtitle)
         loaded_subtitle.filename.unlink()
 
@@ -72,7 +76,7 @@ class TestSubtitle(unittest.TestCase):
 
     def test_set_texts_edge_case(self):
         subtitle = self.subtitle
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             subtitle.set_texts(["Hello"])
 
     def test_set_texts_edge_case_2(self):

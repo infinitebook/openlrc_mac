@@ -1,6 +1,5 @@
 #  Copyright (C) 2024. Hao Zheng
 #  All rights reserved.
-from lingua import Language
 
 # Check https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/transcribe.py for details
 default_asr_options = {
@@ -53,6 +52,25 @@ default_whisper_cpp_options = {
     "suppress_nst": False,  # -sns: suppress non-speech tokens
 }
 
+# File name suffixes used throughout the pipeline.
+# The processing chain produces files like:
+#   audio.wav -> preprocessed/audio_preprocessed.wav
+#     -> audio_preprocessed_transcribed.json
+#       -> audio_preprocessed_transcribed_optimized.json
+#         -> audio_preprocessed_transcribed_optimized_translated.json
+PREPROCESSED_SUFFIX = "_preprocessed"
+TRANSCRIBED_SUFFIX = "_transcribed"
+OPTIMIZED_SUFFIX = "_optimized"
+TRANSLATED_SUFFIX = "_translated"
+COMPARE_SUFFIX = "_compare"
+NONTRANS_SUFFIX = "_nontrans"
+BILINGUAL_SUFFIX = "_bilingual"
+NOISE_SUPPRESSED_SUFFIX = "_ns"
+LOUDNORM_SUFFIX = "_ln"
+
+# Directory name for preprocessed audio files.
+PREPROCESSED_DIR = "preprocessed"
+
 # Currently bottleneck-ed by Spacy
 supported_languages = {
     "ca",
@@ -82,28 +100,28 @@ supported_languages = {
 }
 
 supported_languages_lingua = {
-    Language.CATALAN,
-    Language.CHINESE,
-    Language.CROATIAN,
-    Language.DANISH,
-    Language.DUTCH,
-    Language.ENGLISH,
-    Language.FINNISH,
-    Language.FRENCH,
-    Language.GERMAN,
-    Language.GREEK,
-    Language.ITALIAN,
-    Language.JAPANESE,
-    Language.KOREAN,
-    Language.LITHUANIAN,
-    Language.MACEDONIAN,
-    Language.BOKMAL,
-    Language.POLISH,
-    Language.PORTUGUESE,
-    Language.ROMANIAN,
-    Language.RUSSIAN,
-    Language.SLOVENE,
-    Language.SPANISH,
-    Language.SWEDISH,
-    Language.UKRAINIAN,
+    "CATALAN",
+    "CHINESE",
+    "CROATIAN",
+    "DANISH",
+    "DUTCH",
+    "ENGLISH",
+    "FINNISH",
+    "FRENCH",
+    "GERMAN",
+    "GREEK",
+    "ITALIAN",
+    "JAPANESE",
+    "KOREAN",
+    "LITHUANIAN",
+    "MACEDONIAN",
+    "BOKMAL",
+    "POLISH",
+    "PORTUGUESE",
+    "ROMANIAN",
+    "RUSSIAN",
+    "SLOVENE",
+    "SPANISH",
+    "SWEDISH",
+    "UKRAINIAN",
 }

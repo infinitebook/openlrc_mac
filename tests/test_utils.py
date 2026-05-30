@@ -4,26 +4,29 @@
 import unittest
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
+from openlrc.media_utils import extract_audio, get_file_type, release_memory
 from openlrc.utils import (
     extend_filename,
-    extract_audio,
     format_timestamp,
-    get_file_type,
     get_messages_token_number,
     get_text_token_number,
     normalize,
     parse_timestamp,
-    release_memory,
 )
+
+TEST_DATA_DIR = Path(__file__).parent / "data"
 
 
 class TestUtils(unittest.TestCase):
     def setUp(self) -> None:
-        self.audio_file = Path("data/test_audio.wav")
-        self.video_file = Path("data/test_video.mp4")
-        self.unsupported = Path("data/unsupported_file.xyz")
+        self.audio_file = TEST_DATA_DIR / "test_audio.wav"
+        self.video_file = TEST_DATA_DIR / "test_video.mp4"
+        self.unsupported = TEST_DATA_DIR / "unsupported_file.xyz"
 
     def tearDown(self) -> None:
         self.video_file.with_suffix(".wav").unlink(missing_ok=True)
@@ -100,7 +103,9 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(extend_filename(Path("file.txt"), "_new"), Path("file_new.txt"))
         self.assertEqual(extend_filename(Path("file.txt"), ""), Path("file.txt"))
 
+    @unittest.skipIf(torch is None, "torch is only installed with the full extra")
     def test_release_memory(self):
+        assert torch is not None
         model = torch.nn.Module()
         if torch.cuda.is_available():
             model.cuda()

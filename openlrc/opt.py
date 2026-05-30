@@ -6,6 +6,7 @@ from pathlib import Path
 
 import zhconv
 
+from openlrc.defaults import OPTIMIZED_SUFFIX
 from openlrc.logger import logger
 from openlrc.subtitle import BilingualSubtitle, Subtitle
 from openlrc.utils import extend_filename, format_timestamp
@@ -82,7 +83,8 @@ class SubtitleOptimizer:
 
                 # Merge to previous element if closer to pre-element and gap > 3s
                 previous_gap = current_segment.start - optimized_segments[-1].start
-                assert current_segment.end is not None, "Segment end time must be set for merging"
+                if current_segment.end is None:
+                    raise ValueError("Segment end time must be set for merging")
                 next_gap = element.start - current_segment.end
                 if previous_gap <= next_gap and previous_gap <= 3:
                     previous_element = optimized_segments.pop()
@@ -272,7 +274,7 @@ class SubtitleOptimizer:
         """
         Save the optimized subtitle to a file.
         """
-        optimized_name = extend_filename(self.filename, "_optimized") if not output_name else output_name
+        optimized_name = extend_filename(self.filename, OPTIMIZED_SUFFIX) if not output_name else output_name
         self.subtitle.save(optimized_name, update_name=update_name)
         logger.info(f"Optimized json file saved to {optimized_name}")
 

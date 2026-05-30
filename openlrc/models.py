@@ -1,14 +1,24 @@
 #  Copyright (C) 2025. Hao Zheng
 #  All rights reserved.
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
 
+if sys.version_info >= (3, 11):
+    from enum import StrEnum as _StrEnum
+else:
+    class _StrEnum(str, Enum):
+        """Backport of StrEnum for Python 3.10."""
+        def __str__(self) -> str:
+            return self.value
 
-class ModelProvider(Enum):
+
+class ModelProvider(_StrEnum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GOOGLE = "google"
+    LITELLM = "litellm"
     THIRD_PARTY = "third_party"
 
 
@@ -17,22 +27,56 @@ class ModelConfig:
     """
     Configuration for a specific model.
 
+    Combines identity, connection, and capability parameters into a single
+    config object.  Capability fields (``context_window``, ``max_tokens``)
+    are optional: when set they define output and context-window limits;
+    when ``None`` (the default) the API server's own limits apply, which
+    is the recommended setting for most users.
+
     Attributes:
-        provider (ModelProvider): The provider of the model.
+        provider (ModelProvider | str): The provider of the model.
         name (str): The name of the model.
         base_url (Optional[str]): The base URL for the model API.
         api_key (Optional[str]): The API key for authentication.
         proxy (Optional[str]): The proxy server to use for requests.
+        context_window (Optional[int]): Total context window size in tokens.
+            When set, enables context-window safety checks in ``_compute_max_tokens``.
+        max_tokens (Optional[int]): Maximum output tokens per request.
+            When set, ``_compute_max_tokens`` caps output at this value;
+            when ``None`` (default), ``max_tokens`` is not sent to the API.
+        extra_body (Optional[dict]): Provider-specific parameters passed through
+            to the underlying SDK.  Each chatbot subclass extracts the keys it
+            recognises (e.g. ``frequency_penalty`` for OpenAI, ``top_k`` for
+            Anthropic/Gemini) and forwards the remainder via the SDK's own
+            extension mechanism.  ``None`` (the default) produces the exact same
+            API call as before this field existed.
+
+            Do **not** include keys that are already managed by the chatbot
+            constructor or ``_create_chat`` (e.g. ``temperature``, ``top_p``,
+            ``stop``, ``max_tokens``, ``model``, ``messages``).  Behaviour is
+            undefined if such keys are present.
     """
 
-    provider: ModelProvider
-    name: str
+    provider: ModelProvider | str = ModelProvider.OPENAI
+    name: str = "gpt-4.1-nano"
     base_url: str | None = None
     api_key: str | None = None
     proxy: str | None = None
+    context_window: int | None = None
+    max_tokens: int | None = None
+    extra_body: dict | None = None
+
+    def __post_init__(self):
+        if isinstance(self.provider, str):
+            try:
+                self.provider = ModelProvider(self.provider.lower())
+            except ValueError:
+                # Custom provider strings remain strings, known ones get coerced
+                pass
 
     def __str__(self):
-        return f"{self.provider.value}:{self.name}"
+        provider_str = self.provider.value if isinstance(self.provider, ModelProvider) else self.provider
+        return f"{provider_str}:{self.name}"
 
 
 @dataclass
@@ -41,8 +85,6 @@ class ModelInfo:
     provider: ModelProvider
     input_price: float  # per million tokens
     output_price: float  # per million tokens
-    max_tokens: int
-    context_window: int
     vision_support: bool = False
     knowledge_cutoff: str | None = None
     latest_alias: str | None = None
@@ -56,8 +98,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=15.0,
         output_price=75.0,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
         latest_alias="claude-3-opus-latest",
@@ -68,8 +108,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
     )
@@ -79,8 +117,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=0.25,
         output_price=1.25,
-        max_tokens=4096,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Aug 2023",
     )
@@ -90,8 +126,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Apr 2024",
         latest_alias="claude-3-5-sonnet-latest",
@@ -102,8 +136,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=3.0,
         output_price=15.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=True,
         knowledge_cutoff="Apr 2024",
         latest_alias="claude-3-7-sonnet-latest",
@@ -114,8 +146,6 @@ class Models:
         provider=ModelProvider.ANTHROPIC,
         input_price=0.80,
         output_price=4.0,
-        max_tokens=8192,
-        context_window=200000,
         vision_support=False,
         knowledge_cutoff="July 2024",
         latest_alias="claude-3-5-haiku-latest",
@@ -127,8 +157,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=16384,
-        context_window=128000,
         vision_support=False,
         knowledge_cutoff="Oct 2023",
         latest_alias="gpt-4o",
@@ -139,8 +167,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=5.0,
         output_price=15.0,
-        max_tokens=16384,
-        context_window=128000,
         vision_support=False,
         knowledge_cutoff="Oct 2023",
         latest_alias="gpt-4o-mini",
@@ -151,8 +177,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Dec 2023",
         latest_alias="gpt-4-turbo",
@@ -163,8 +187,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Dec 2023",
         latest_alias="gpt-4-turbo-preview",
@@ -175,8 +197,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=10.0,
         output_price=30.0,
-        max_tokens=4096,
-        context_window=128000,
         vision_support=True,
         knowledge_cutoff="Apr 2023",
     )
@@ -186,8 +206,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=30.0,
         output_price=60.0,
-        max_tokens=8192,
-        context_window=8192,
         vision_support=False,
         knowledge_cutoff="Sep 2021",
         latest_alias="gpt-4",
@@ -198,8 +216,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.5,
         output_price=1.5,
-        max_tokens=4096,
-        context_window=16385,
         knowledge_cutoff="Sep 2021",
         latest_alias="gpt-3.5-turbo",
     )
@@ -209,8 +225,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.1,
         output_price=0.4,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -219,8 +233,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=0.4,
         output_price=1.6,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -229,8 +241,6 @@ class Models:
         provider=ModelProvider.OPENAI,
         input_price=2.0,
         output_price=8.0,
-        max_tokens=32768,
-        context_window=1047576,
         knowledge_cutoff="Jun 01, 2024",
     )
 
@@ -240,8 +250,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=1.25,
         output_price=5.0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
     )
 
@@ -250,8 +258,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0.075,
         output_price=0.30,
-        max_tokens=8192,
-        context_window=1048576,
     )
 
     GEMINI_FLASH_8B = ModelInfo(
@@ -259,8 +265,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0.0375,
         output_price=0.15,
-        max_tokens=8192,
-        context_window=1048576,
     )
 
     GEMINI_2_0_FLASH_LITE = ModelInfo(
@@ -268,8 +272,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -279,8 +281,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -290,8 +290,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -301,8 +299,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=2097152,
         vision_support=True,
         knowledge_cutoff="Aug 2024",
     )
@@ -312,8 +308,6 @@ class Models:
         provider=ModelProvider.GOOGLE,
         input_price=0,
         output_price=0,
-        max_tokens=8192,
-        context_window=1048576,
         vision_support=True,
         knowledge_cutoff="Jan 2025",
     )
@@ -324,8 +318,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=4096,
-        context_window=32768,
     )
 
     DEEPSEEK_BETA = ModelInfo(
@@ -333,8 +325,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=32768,
         beta=True,
     )
 
@@ -343,8 +333,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=65536,
         beta=False,
     )
 
@@ -353,8 +341,6 @@ class Models:
         provider=ModelProvider.THIRD_PARTY,
         input_price=0.14,
         output_price=0.28,
-        max_tokens=8192,
-        context_window=65536,
         beta=False,
     )
 
@@ -367,8 +353,6 @@ class Models:
                 provider=ModelProvider.OPENAI,
                 input_price=10.0,
                 output_price=30.0,
-                max_tokens=8192,
-                context_window=8192,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -383,8 +367,6 @@ class Models:
                 provider=ModelProvider.ANTHROPIC,
                 input_price=8.0,
                 output_price=24.0,
-                max_tokens=4096,
-                context_window=100000,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -399,8 +381,20 @@ class Models:
                 provider=ModelProvider.GOOGLE,
                 input_price=1.0,
                 output_price=3.0,
-                max_tokens=8192,
-                context_window=32768,
+                vision_support=False,
+                knowledge_cutoff=None,
+                latest_alias=None,
+            )
+
+    class DefaultLiteLLMModelInfo(ModelInfo):
+        """Default configuration for LiteLLM-routed models."""
+
+        def __init__(self, model_name: str):
+            super().__init__(
+                name=model_name,
+                provider=ModelProvider.LITELLM,
+                input_price=1.0,
+                output_price=1.0,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -415,8 +409,6 @@ class Models:
                 provider=ModelProvider.THIRD_PARTY,
                 input_price=1.0,
                 output_price=0.2,
-                max_tokens=4096,
-                context_window=32768,
                 vision_support=False,
                 knowledge_cutoff=None,
                 latest_alias=None,
@@ -450,11 +442,24 @@ class Models:
 
         # If no exact match found, try to infer provider from model name
         # Note the model_provider is not vital for next processing
-        if any(name in model_name.lower() for name in ["gpt", "openai", "davinci", "text-", "curie"]):
+        # LiteLLM uses provider/model format -- infer from prefix
+        lower_name = model_name.lower()
+        if lower_name.startswith("openai/"):
             default_model = cls.DefaultOpenAIModelInfo(model_name)
-        elif any(name in model_name.lower() for name in ["claude", "anthropic"]):
+        elif lower_name.startswith("anthropic/"):
             default_model = cls.DefaultAnthropicModelInfo(model_name)
-        elif any(name in model_name.lower() for name in ["gemini", "google", "palm"]):
+        elif lower_name.startswith(("gemini/", "google/")):
+            default_model = cls.DefaultGeminiModelInfo(model_name)
+        elif "/" in model_name and lower_name.split("/")[0] in (
+            "groq", "together_ai", "deepseek", "mistral", "bedrock",
+            "vertex_ai", "azure", "cohere", "fireworks", "replicate",
+        ):
+            default_model = cls.DefaultThirdPartyModelInfo(model_name)
+        elif any(name in lower_name for name in ["gpt", "openai", "davinci", "text-", "curie"]):
+            default_model = cls.DefaultOpenAIModelInfo(model_name)
+        elif any(name in lower_name for name in ["claude", "anthropic"]):
+            default_model = cls.DefaultAnthropicModelInfo(model_name)
+        elif any(name in lower_name for name in ["gemini", "google", "palm"]):
             default_model = cls.DefaultGeminiModelInfo(model_name)
         else:
             default_model = cls.DefaultThirdPartyModelInfo(model_name)

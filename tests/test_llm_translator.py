@@ -66,14 +66,86 @@ class TestMakeChunks(unittest.TestCase):
         self.assertEqual(all_line_numbers, list(range(1, 9)))
 
 
+class TestMakeChunksByTokens(unittest.TestCase):
+    """Unit tests for LLMTranslator.make_chunks_by_tokens."""
+
+    def _make_translator(self, chunk_size=30, max_chunk_tokens=1000, scene_threshold=30.0):
+        bot = _make_mock_chatbot()
+        t = LLMTranslator(chatbot=bot, chunk_size=chunk_size)
+        t.MAX_CHUNK_TOKENS = max_chunk_tokens
+        t.SCENE_THRESHOLD = scene_threshold
+        return t
+
+    def test_no_timestamps_splits_by_tokens(self):
+        """Without timestamps, chunks are split by token budget only."""
+        # Use a very small token budget to force splitting.
+        translator = self._make_translator(max_chunk_tokens=20)
+        texts = [f"word{i} " * 5 for i in range(6)]  # Each line ~5 tokens
+        chunks = translator.make_chunks_by_tokens(texts)
+        # With ~5 tokens per line and budget=20, expect ~4 lines per chunk.
+        self.assertTrue(all(len(c) <= 5 for c in chunks))
+        # All lines present.
+        all_nums = [num for c in chunks for num, _ in c]
+        self.assertEqual(all_nums, list(range(1, 7)))
+
+    def test_scene_boundary_forces_split(self):
+        """A time gap > SCENE_THRESHOLD forces a chunk break."""
+        translator = self._make_translator(max_chunk_tokens=10000, scene_threshold=30.0)
+        texts = ["line1", "line2", "line3", "line4"]
+        # 60s gap between line2 and line3 → scene boundary.
+        translator.timestamps = [(0.0, 1.0), (1.0, 2.0), (62.0, 63.0), (63.0, 64.0)]
+        chunks = translator.make_chunks_by_tokens(texts)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual([n for n, _ in chunks[0]], [1, 2])
+        self.assertEqual([n for n, _ in chunks[1]], [3, 4])
+
+    def test_line_count_cap(self):
+        """chunk_size acts as a line-count upper bound."""
+        translator = self._make_translator(chunk_size=3, max_chunk_tokens=10000)
+        texts = [f"short{i}" for i in range(9)]
+        chunks = translator.make_chunks_by_tokens(texts)
+        self.assertTrue(all(len(c) <= 3 for c in chunks))
+
+    def test_empty_input(self):
+        translator = self._make_translator()
+        self.assertEqual(translator.make_chunks_by_tokens([]), [])
+
+    def test_small_tail_merged(self):
+        """A small trailing chunk is merged into the previous one."""
+        translator = self._make_translator(chunk_size=5, max_chunk_tokens=10000)
+        texts = [f"text{i}" for i in range(7)]  # 5 + 2, tail 2 < 5/2 → merge
+        chunks = translator.make_chunks_by_tokens(texts)
+        self.assertEqual(len(chunks), 1)  # All merged into one chunk.
+
+    def test_best_split_at_largest_gap(self):
+        """When token budget is exceeded, split at the largest time gap."""
+        translator = self._make_translator(max_chunk_tokens=30, chunk_size=30)
+        texts = ["word " * 5] * 6  # Each line ~5 tokens, total ~30 → triggers split
+        # Largest gap between line 3 and line 4 (10s gap vs 1s gaps).
+        timestamps = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (13.0, 14.0), (14.0, 15.0), (15.0, 16.0)]
+        translator.timestamps = timestamps
+        chunks = translator.make_chunks_by_tokens(texts)
+        # Should split at the 10s gap (between line 3 and 4).
+        self.assertTrue(len(chunks) >= 2)
+        first_chunk_lines = [n for n, _ in chunks[0]]
+        self.assertIn(3, first_chunk_lines)
+        self.assertNotIn(4, first_chunk_lines)
+
+
+def _make_mock_chatbot(name: str = "gpt-4.1-nano") -> MagicMock:
+    """Return a lightweight mock ChatBot."""
+    bot = MagicMock()
+    bot.model_name = name
+    bot.close = MagicMock()
+    return bot
+
+
 @patch.dict(os.environ, {"OPENAI_API_KEY": "test-dummy"})
 class TestLLMTranslatorTranslate(unittest.TestCase):
     """Mock tests for LLMTranslator.translate() — no real API calls."""
 
-    def _make_translator(self, chunk_size=30, retry_model=None):
-        return LLMTranslator(
-            chatbot_model="gpt-4.1-nano", fee_limit=0.8, chunk_size=chunk_size, retry_model=retry_model
-        )
+    def _make_translator(self, chunk_size=30, retry_chatbot=None):
+        return LLMTranslator(chatbot=_make_mock_chatbot(), chunk_size=chunk_size, retry_chatbot=retry_chatbot)
 
     def _mock_translate_chunk(self, translations, summary="summary", scene="scene"):
         """Return a side_effect function that returns translations matching chunk length."""
@@ -235,7 +307,7 @@ class TestLLMTranslatorTranslate(unittest.TestCase):
         mock_reviewer = mock_reviewer_cls.return_value
         mock_reviewer.build_context.return_value = "guideline"
 
-        translator = self._make_translator(chunk_size=30, retry_model="gpt-4.1-nano")
+        translator = self._make_translator(chunk_size=30, retry_chatbot=_make_mock_chatbot())
         with tempfile.TemporaryDirectory() as tmpdir:
             compare_path = Path(tmpdir) / "compare.json"
             result = translator.translate(texts, "en", "zh", compare_path=compare_path)
@@ -243,6 +315,113 @@ class TestLLMTranslatorTranslate(unittest.TestCase):
         self.assertEqual(result, ["你好", "世界"])
         primary_agent.translate_chunk.assert_called_once()
         retry_agent.translate_chunk.assert_called_once()
+
+    @patch("openlrc.translate.ContextReviewerAgent")
+    @patch("openlrc.translate.ChunkedTranslatorAgent")
+    def test_retry_streak_resets_when_retry_agent_also_fails(self, mock_agent_cls, mock_reviewer_cls):
+        """When retry agent also returns wrong length, use_retry_cnt resets to 0."""
+        texts = ["Hello", "World"]
+
+        primary_agent = MagicMock()
+        primary_agent.cost = 0
+        primary_agent.info.glossary = None
+        primary_agent.translate_chunk.return_value = (
+            ["only_one"],
+            TranslationContext(summary="s", scene="sc", guideline="g"),
+        )
+
+        retry_agent = MagicMock()
+        retry_agent.cost = 0
+        retry_agent.info.glossary = None
+        # Retry also returns wrong length
+        retry_agent.translate_chunk.return_value = (
+            ["still_wrong"],
+            TranslationContext(summary="s", scene="sc", guideline="g"),
+        )
+
+        mock_agent_cls.side_effect = [primary_agent, retry_agent]
+
+        mock_reviewer = mock_reviewer_cls.return_value
+        mock_reviewer.build_context.return_value = "guideline"
+
+        translator = self._make_translator(chunk_size=30, retry_chatbot=_make_mock_chatbot())
+
+        # Mock atomic_translate to provide fallback
+        translator.atomic_translate = MagicMock(return_value=["你好", "世界"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            compare_path = Path(tmpdir) / "compare.json"
+            result = translator.translate(texts, "en", "zh", compare_path=compare_path)
+
+        self.assertEqual(result, ["你好", "世界"])
+        # Both agents were tried
+        primary_agent.translate_chunk.assert_called_once()
+        retry_agent.translate_chunk.assert_called_once()
+        # Streak should be reset to 0 after retry agent also failed
+        self.assertEqual(translator.use_retry_cnt, 0)
+
+    @patch("openlrc.translate.ContextReviewerAgent")
+    @patch("openlrc.translate.ChunkedTranslatorAgent")
+    def test_binary_split_retry_on_mismatch(self, mock_agent_cls, mock_reviewer_cls):
+        """When full chunk fails, binary split translates each half successfully."""
+        texts = [f"line{i}" for i in range(6)]
+
+        call_count = 0
+
+        def translate_chunk_side_effect(chunk_id, chunk, context, use_glossary=True):
+            nonlocal call_count
+            call_count += 1
+            ctx = TranslationContext(summary="s", scene="sc", guideline=context.guideline)
+            # First call (full 6-line chunk) returns wrong length
+            if len(chunk) == 6:
+                return ["wrong"], ctx
+            # Halves (3 lines each) succeed
+            return [f"trans_{c[0]}" for c in chunk], ctx
+
+        mock_agent = mock_agent_cls.return_value
+        mock_agent.cost = 0
+        mock_agent.info.glossary = None
+        mock_agent.translate_chunk.side_effect = translate_chunk_side_effect
+
+        mock_reviewer = mock_reviewer_cls.return_value
+        mock_reviewer.build_context.return_value = "guideline"
+
+        translator = self._make_translator(chunk_size=30)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            compare_path = Path(tmpdir) / "compare.json"
+            result = translator.translate(texts, "en", "zh", compare_path=compare_path)
+
+        # 6 translations from two successful halves
+        self.assertEqual(len(result), 6)
+        self.assertTrue(all(r.startswith("trans_") for r in result))
+
+    @patch("openlrc.translate.ContextReviewerAgent")
+    @patch("openlrc.translate.ChunkedTranslatorAgent")
+    def test_binary_split_falls_back_to_atomic(self, mock_agent_cls, mock_reviewer_cls):
+        """When halves are below MIN_SPLIT_SIZE and still fail, atomic is used."""
+        texts = ["Hello", "World"]
+
+        mock_agent = mock_agent_cls.return_value
+        mock_agent.cost = 0
+        mock_agent.info.glossary = None
+        # Always return wrong length
+        mock_agent.translate_chunk.return_value = (
+            ["wrong"],
+            TranslationContext(summary="s", scene="sc", guideline="g"),
+        )
+
+        mock_reviewer = mock_reviewer_cls.return_value
+        mock_reviewer.build_context.return_value = "guideline"
+
+        translator = self._make_translator(chunk_size=30)
+        translator.atomic_translate = MagicMock(return_value=["你好", "世界"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            compare_path = Path(tmpdir) / "compare.json"
+            result = translator.translate(texts, "en", "zh", compare_path=compare_path)
+
+        self.assertEqual(result, ["你好", "世界"])
+        translator.atomic_translate.assert_called_once()
 
     @patch("openlrc.translate.ContextReviewerAgent")
     @patch("openlrc.translate.ChunkedTranslatorAgent")
@@ -292,3 +471,108 @@ class TestLLMTranslatorTranslate(unittest.TestCase):
         mock_reviewer.build_context.assert_not_called()
         # translate_chunk called only once (for chunk 2)
         mock_agent.translate_chunk.assert_called_once()
+
+
+class TestCheckpoint(unittest.TestCase):
+    """Unit tests for BaseLLMTranslator._save_checkpoint / _load_checkpoint."""
+
+    def _make_translator(self):
+        return LLMTranslator(chatbot=_make_mock_chatbot(), chunk_size=30)
+
+    def test_save_checkpoint_produces_expected_json(self):
+        """_save_checkpoint writes JSON with 'compare' key plus context keys."""
+        translator = self._make_translator()
+        compare_list = [
+            {"chunk": 1, "idx": 1, "method": "chunked", "model": "gpt-4", "input": "hello", "output": "你好"},
+            {"chunk": 1, "idx": 2, "method": "chunked", "model": "gpt-4", "input": "world", "output": "世界"},
+        ]
+        context = {"summaries": ["A greeting."], "scene": "office", "guideline": "Translate naturally."}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            translator._save_checkpoint(path, compare_list, context)
+
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+
+        self.assertEqual(data["compare"], compare_list)
+        self.assertEqual(data["summaries"], ["A greeting."])
+        self.assertEqual(data["scene"], "office")
+        self.assertEqual(data["guideline"], "Translate naturally.")
+
+    def test_load_checkpoint_restores_state(self):
+        """_load_checkpoint correctly restores translations, compare_list, start_chunk, and context."""
+        translator = self._make_translator()
+
+        saved = {
+            "compare": [
+                {"chunk": 1, "idx": 1, "method": "chunked", "model": "gpt-4", "input": "hello", "output": "你好"},
+                {"chunk": 1, "idx": 2, "method": "chunked", "model": "gpt-4", "input": "world", "output": "世界"},
+                {"chunk": 2, "idx": 3, "method": "atomic", "model": "gpt-4", "input": "foo", "output": "富"},
+            ],
+            "summaries": ["sum1", "sum2"],
+            "scene": "park",
+            "guideline": "Be concise.",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(saved, f)
+
+            translations, compare_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, ["你好", "世界", "富"])
+        self.assertEqual(len(compare_list), 3)
+        self.assertEqual(start_chunk, 2)
+        self.assertEqual(ctx["summaries"], ["sum1", "sum2"])
+        self.assertEqual(ctx["scene"], "park")
+        self.assertEqual(ctx["guideline"], "Be concise.")
+
+    def test_load_checkpoint_file_not_exists(self):
+        """_load_checkpoint returns empty defaults when file does not exist."""
+        translator = self._make_translator()
+        translations, compare_list, start_chunk, ctx = translator._load_checkpoint(Path("/nonexistent/path.json"))
+
+        self.assertEqual(translations, [])
+        self.assertEqual(compare_list, [])
+        self.assertEqual(start_chunk, 0)
+        self.assertEqual(ctx, {})
+
+    def test_load_checkpoint_empty_compare_list(self):
+        """_load_checkpoint handles empty compare list without IndexError."""
+        translator = self._make_translator()
+
+        saved = {"compare": [], "summaries": [], "guideline": "test"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(saved, f)
+
+            translations, compare_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, [])
+        self.assertEqual(compare_list, [])
+        self.assertEqual(start_chunk, 0)
+        self.assertEqual(ctx["guideline"], "test")
+
+    def test_save_load_roundtrip(self):
+        """Data survives a save -> load roundtrip with identical semantics."""
+        translator = self._make_translator()
+        compare_list = [
+            {"chunk": 3, "idx": 7, "method": "chunked", "model": "gpt-4", "input": "hi", "output": "嗨"},
+        ]
+        context = {"summaries": ["s1", "s2", "s3"], "scene": "beach", "guideline": "Keep it casual."}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.json"
+            translator._save_checkpoint(path, compare_list, context)
+            translations, loaded_list, start_chunk, ctx = translator._load_checkpoint(path)
+
+        self.assertEqual(translations, ["嗨"])
+        self.assertEqual(loaded_list, compare_list)
+        self.assertEqual(start_chunk, 3)
+        self.assertEqual(ctx["summaries"], ["s1", "s2", "s3"])
+        self.assertEqual(ctx["scene"], "beach")
+        self.assertEqual(ctx["guideline"], "Keep it casual.")

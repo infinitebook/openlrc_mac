@@ -3,10 +3,11 @@
 import abc
 import json
 import re
+from typing import Any
 
 from json_repair import repair_json
 
-from openlrc.chatbot import ClaudeBot, GeminiBot, GPTBot, provider2chatbot, route_chatbot
+from openlrc.chatbot import ChatBot, GPTBot, provider2chatbot, route_chatbot
 from openlrc.context import TranslateInfo, TranslationContext
 from openlrc.logger import logger
 from openlrc.models import ModelConfig, ModelProvider
@@ -15,10 +16,65 @@ from openlrc.prompter import (
     ChunkedTranslatePrompter,
     ContextReviewerValidatePrompter,
     ContextReviewPrompter,
+    ContextReviewPrompterBase,
     ProofreaderPrompter,
     TranslationEvaluatorPrompter,
 )
+from openlrc.utils import get_text_token_number
 from openlrc.validators import POTENTIAL_PREFIX_COMBOS
+
+
+def create_chatbot(
+    chatbot_model: str | ModelConfig,
+    fee_limit: float = 0.8,
+    proxy: str | None = None,
+    base_url_config: dict | None = None,
+) -> ChatBot:
+    """Create a ChatBot instance from a model name or ModelConfig.
+
+    The caller is responsible for closing the returned ChatBot when done
+    (via ``close()`` or a ``with`` statement).
+    """
+    if isinstance(chatbot_model, str):
+        chatbot_cls, model_name = route_chatbot(chatbot_model)
+        return chatbot_cls(
+            model_name=model_name, fee_limit=fee_limit, proxy=proxy, retry=4, base_url_config=base_url_config
+        )
+    elif isinstance(chatbot_model, ModelConfig):
+        # Resolve chatbot class: known provider or custom provider (defaults to GPTBot)
+        chatbot_cls: type[Any] = provider2chatbot.get(chatbot_model.provider, GPTBot)
+        proxy = chatbot_model.proxy or proxy
+
+        if chatbot_model.base_url:
+            if chatbot_model.provider == ModelProvider.ANTHROPIC:
+                base_url_config = {"anthropic": chatbot_model.base_url}
+            elif chatbot_model.provider == ModelProvider.GOOGLE:
+                logger.warning(
+                    f"Google Gemini SDK does not support custom base_url ({chatbot_model.base_url}), "
+                    f"ignoring. Use system-level proxy if needed."
+                )
+                base_url_config = None
+            elif chatbot_model.provider == ModelProvider.LITELLM:
+                base_url_config = {"litellm": chatbot_model.base_url}
+            else:
+                # OpenAI, THIRD_PARTY, and custom string providers all use GPTBot compatibility layer
+                base_url_config = {"openai": chatbot_model.base_url}
+
+        bot = chatbot_cls(
+            model_name=chatbot_model.name,
+            fee_limit=fee_limit,
+            proxy=proxy,
+            retry=4,
+            base_url_config=base_url_config,
+            api_key=chatbot_model.api_key,
+            extra_body=chatbot_model.extra_body,
+        )
+
+        bot.model_config = chatbot_model
+
+        return bot
+    else:
+        raise ValueError(f"Invalid chatbot model type: {type(chatbot_model)}. Expected str or ModelConfig.")
 
 
 class Agent(abc.ABC):
@@ -30,58 +86,6 @@ class Agent(abc.ABC):
     """
 
     TEMPERATURE = 1
-
-    def _initialize_chatbot(
-        self, chatbot_model: str | ModelConfig, fee_limit: float, proxy: str | None, base_url_config: dict | None
-    ) -> ClaudeBot | GPTBot | GeminiBot:
-        """
-        Initialize a chatbot instance based on the provided parameters.
-
-        Args:
-            chatbot_model (Union[str, ModelConfig]): The name of the chatbot model or ModelConfig.
-            fee_limit (float): The maximum fee allowed for API calls.
-            proxy (str): Proxy server to use for API calls.
-            base_url_config (Optional[dict]): Configuration for the base URL of the API.
-
-        Returns:
-            Union[ClaudeBot, GPTBot]: An instance of the appropriate chatbot class.
-        """
-
-        if isinstance(chatbot_model, str):
-            chatbot_cls: type[ClaudeBot] | type[GPTBot] | type[GeminiBot]
-            chatbot_cls, model_name = route_chatbot(chatbot_model)
-            return chatbot_cls(
-                model_name=model_name,
-                fee_limit=fee_limit,
-                proxy=proxy,
-                retry=4,
-                temperature=self.TEMPERATURE,
-                base_url_config=base_url_config,
-            )
-        elif isinstance(chatbot_model, ModelConfig):
-            chatbot_cls = provider2chatbot[chatbot_model.provider]
-            proxy = chatbot_model.proxy or proxy
-
-            if chatbot_model.base_url:
-                if chatbot_model.provider == ModelProvider.OPENAI:
-                    base_url_config = {"openai": chatbot_model.base_url}
-                elif chatbot_model.provider == ModelProvider.ANTHROPIC:
-                    base_url_config = {"anthropic": chatbot_model.base_url}
-                else:
-                    base_url_config = None
-                    logger.warning(f"Unsupported base_url configuration for provider: {chatbot_model.provider}")
-
-            return chatbot_cls(
-                model_name=chatbot_model.name,
-                fee_limit=fee_limit,
-                proxy=proxy,
-                retry=4,
-                temperature=self.TEMPERATURE,
-                base_url_config=base_url_config,
-                api_key=chatbot_model.api_key,
-            )
-        else:
-            raise ValueError(f"Invalid chatbot model type: {type(chatbot_model)}. Expected str or ModelConfig.")
 
 
 class ChunkedTranslatorAgent(Agent):
@@ -95,35 +99,24 @@ class ChunkedTranslatorAgent(Agent):
     """
 
     TEMPERATURE = 1.0
+    OUTPUT_RATIO = 2.5  # Source + target output (#id + Original> + Translation>)
 
-    def __init__(
-        self,
-        src_lang,
-        target_lang,
-        info: TranslateInfo | None = None,
-        chatbot_model: str | ModelConfig = "gpt-4.1-nano",
-        fee_limit: float = 0.8,
-        proxy: str | None = None,
-        base_url_config: dict | None = None,
-    ):
+    def __init__(self, src_lang: str, target_lang: str, info: TranslateInfo | None = None, *, chatbot: ChatBot):
         """
         Initialize the ChunkedTranslatorAgent.
 
         Args:
-            src_lang (str): The source language.
-            target_lang (str): The target language for translation.
-            info (TranslateInfo): Additional translation information.
-            chatbot_model (Union[str, ModelConfig]): The name of the chatbot model or ModelConfig.
-            fee_limit (float): The maximum fee allowed for API calls.
-            proxy (str): Proxy server to use for API calls.
-            base_url_config (Optional[dict]): Configuration for the base URL of the API.
+            src_lang: The source language.
+            target_lang: The target language for translation.
+            info: Additional translation information.
+            chatbot: ChatBot instance to use for LLM calls.
         """
         super().__init__()
         if info is None:
             info = TranslateInfo()
-        self.chatbot_model = chatbot_model
         self.info = info
-        self.chatbot = self._initialize_chatbot(chatbot_model, fee_limit, proxy, base_url_config)
+        self.chatbot = chatbot
+        self.chatbot_model = chatbot.model_name
         self.prompter = ChunkedTranslatePrompter(src_lang, target_lang, info)
         self.cost = 0
 
@@ -201,6 +194,11 @@ class ChunkedTranslatorAgent(Agent):
             return [re.sub(r"(<.*?>|</.*?>).*", "", t, flags=re.DOTALL) for t in translations]
         return translations
 
+    def _estimate_output_tokens(self, chunk: list[tuple[int, str]]) -> int:
+        """Estimate how many output tokens this chunk is likely to require."""
+        content_tokens = sum(get_text_token_number(text) for _, text in chunk)
+        return max(1024, int(content_tokens * self.OUTPUT_RATIO))
+
     def translate_chunk(
         self,
         chunk_id: int,
@@ -231,7 +229,11 @@ class ChunkedTranslatorAgent(Agent):
                 "content": self.prompter.user(chunk_id, user_input, context.previous_summaries or "", guideline or ""),
             },
         ]
-        resp = self.chatbot.message(messages_list, output_checker=self.prompter.check_format)[0]
+        min_tokens = self._estimate_output_tokens(chunk)
+        resp = self.chatbot.message(
+            messages_list, output_checker=self.prompter.check_format, temperature=self.TEMPERATURE,
+            min_tokens=min_tokens,
+        )[0]
         translations, summary, scene = self._parse_responses(resp)
         self.cost += self.chatbot.api_fees[-1]
         context.update(summary=summary, scene=scene, model=self.chatbot_model)
@@ -243,37 +245,43 @@ class ContextReviewerAgent(Agent):
     """
     Agent responsible for reviewing the context of subtitles to ensure accuracy and completeness.
 
-    TODO: Add chunking support.
-
     Attributes:
         TEMPERATURE (float): The temperature setting for the language model.
+        MIN_OUTPUT_TOKENS (int): Minimum tokens reserved for LLM output.
+        MIN_CHUNK_TEXT_TOKENS (int): Minimum text tokens per chunk for chunked generation.
+        MERGE_RETRIES (int): Number of retries for merging partial guidelines.
     """
 
     TEMPERATURE = 0.6
+    MIN_OUTPUT_TOKENS = 1024
+    MIN_CHUNK_TEXT_TOKENS = 256
+    MERGE_RETRIES = 3
 
     def __init__(
         self,
-        src_lang,
-        target_lang,
+        src_lang: str,
+        target_lang: str,
         info: TranslateInfo | None = None,
-        chatbot_model: str | ModelConfig = "gpt-4.1-nano",
-        retry_model: str | ModelConfig | None = None,
-        fee_limit: float = 0.8,
-        proxy: str | None = None,
-        base_url_config: dict | None = None,
+        *,
+        chatbot: ChatBot,
+        retry_chatbot: ChatBot | None = None,
+        chunked_guideline: bool = False,
+        prompter: ContextReviewPrompterBase | None = None,
     ):
         """
         Initialize the ContextReviewerAgent.
 
         Args:
-            src_lang (str): The source language.
-            target_lang (str): The target language.
-            info (TranslateInfo): Additional translation information.
-            chatbot_model (Union[str, ModelConfig]): The name or ModelConfig of the primary chatbot model.
-            retry_model (Union[str, ModelConfig]): The name or ModelConfig of the backup chatbot model to use for retries.
-            fee_limit (float): The maximum fee allowed for API calls.
-            proxy (str): Proxy server to use for API calls.
-            base_url_config (Optional[dict]): Configuration for the base URL of the API.
+            src_lang: The source language.
+            target_lang: The target language.
+            info: Additional translation information.
+            chatbot: ChatBot instance to use for LLM calls.
+            retry_chatbot: Optional ChatBot instance for retry attempts.
+            chunked_guideline: Enable chunked guideline generation for long texts.
+                When False (default), long texts that exceed the context window will fail.
+                When True, automatically splits into chunks and merges partial guidelines.
+            prompter: Optional prompter instance.  Defaults to
+                :class:`ContextReviewPrompter` when not provided.
         """
         super().__init__()
         if info is None:
@@ -281,13 +289,12 @@ class ContextReviewerAgent(Agent):
         self.src_lang = src_lang
         self.target_lang = target_lang
         self.info = info
-        self.chatbot_model = chatbot_model
+        self.chatbot = chatbot
+        self.chatbot_model = chatbot.model_name
+        self.chunked_guideline = chunked_guideline
         self.validate_prompter = ContextReviewerValidatePrompter()
-        self.prompter = ContextReviewPrompter(src_lang, target_lang)
-        self.chatbot = self._initialize_chatbot(chatbot_model, fee_limit, proxy, base_url_config)
-        self.retry_chatbot = (
-            self._initialize_chatbot(retry_model, fee_limit, proxy, base_url_config) if retry_model else None
-        )
+        self.prompter = prompter or ContextReviewPrompter(src_lang, target_lang)
+        self.retry_chatbot = retry_chatbot
 
     def __str__(self):
         return f"Context Reviewer Agent ({self.chatbot_model})"
@@ -307,7 +314,7 @@ class ContextReviewerAgent(Agent):
 
         # Use the content to check first
         lowered_context = context.lower()
-        keywords = ["glossary", "characters", "summary", "tone and style", "target audience"]
+        keywords = self.prompter.expected_sections
         if all(keyword in lowered_context for keyword in keywords):
             return True
 
@@ -319,6 +326,7 @@ class ContextReviewerAgent(Agent):
             messages_list,
             stop_sequences=[self.prompter.stop_sequence],
             output_checker=self.validate_prompter.check_format,
+            temperature=self.TEMPERATURE,
         )[0]
         content = self.chatbot.get_content(resp)
         return bool(content and "true" in content.lower())
@@ -326,6 +334,9 @@ class ContextReviewerAgent(Agent):
     def build_context(self, texts, title="", glossary: dict | None = None, forced_glossary=False) -> str:
         """
         Build the context for translation based on the provided texts and additional information.
+
+        Automatically splits into chunks when the full text would exceed the model's
+        context window, generates partial guidelines per chunk, then merges them.
 
         Args:
             texts (List[str]): The texts to build context from.
@@ -338,34 +349,91 @@ class ContextReviewerAgent(Agent):
         """
         text_content = "\n".join(texts)
 
+        # Estimate whether the full text fits in a single pass.
+        system_tokens = get_text_token_number(self.prompter.system())
+        user_tokens = get_text_token_number(self.prompter.user(text_content, title=title, given_glossary=glossary))
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
+        available_output = int(context_window * 0.90) - system_tokens - user_tokens
+
+        if available_output >= self.MIN_OUTPUT_TOKENS:
+            try:
+                context = self._build_context_single(text_content, title, glossary)
+            except Exception as e:
+                if self.chunked_guideline:
+                    logger.warning(f"Single-pass guideline failed ({e}), falling back to chunked generation.")
+                    context = self._build_context_chunked(texts, title, glossary)
+                else:
+                    logger.error(
+                        f"Guideline generation failed: {e}. "
+                        f"Consider enabling chunked_guideline=True or using a model with a larger context window."
+                    )
+                    raise
+        elif self.chunked_guideline:
+            logger.info(
+                f"Input too large for single pass (available_output={available_output}), splitting into chunks."
+            )
+            context = self._build_context_chunked(texts, title, glossary)
+        else:
+            logger.warning(
+                f"Input too large for context window (available_output={available_output}). "
+                f"Enable chunked_guideline=True to handle long texts. Returning empty guideline."
+            )
+            context = ""
+
+        if forced_glossary and glossary:
+            context = self.add_external_glossary(context, glossary)
+
+        return context
+
+    def _build_context_single(self, text_content: str, title: str, glossary: dict | None) -> str:
+        """Generate guideline from the full text in a single LLM call.
+
+        Retries only on format validation failures. Deterministic errors
+        (e.g. context window exceeded) are re-raised immediately.
+        """
+        from openlrc.exceptions import ChatBotException
+
         messages_list = [
             {"role": "system", "content": self.prompter.system()},
             {"role": "user", "content": self.prompter.user(text_content, title=title, given_glossary=glossary)},
         ]
 
-        context = None
-        try:
-            resp = self.chatbot.message(
-                messages_list, stop_sequences=[self.prompter.stop_sequence], output_checker=self.prompter.check_format
-            )[0]
-            context = self.chatbot.get_content(resp)
-            if context:
-                context = context.rstrip(self.prompter.stop_sequence)  # remove the stop sequence if present
-        except Exception as e:
-            logger.warning(f"Failed to generate context: {e} using {self.chatbot_model}")
-
-        context_pool: list[str] = [context] if context else []
-        # Validate
-        if not context or not self._validate_context(context):
-            validated = False
-            if self.retry_chatbot:
-                logger.info(f"Failed to validate the context using {self.chatbot}, retrying with {self.retry_chatbot}")
-                resp = self.retry_chatbot.message(
+        def _try_generate(bot, label: str) -> str | None:
+            """Attempt one LLM call. Returns content or None on format failure. Raises on deterministic errors."""
+            try:
+                resp = bot.message(
                     messages_list,
                     stop_sequences=[self.prompter.stop_sequence],
                     output_checker=self.prompter.check_format,
+                    temperature=self.TEMPERATURE,
                 )[0]
-                context = self.retry_chatbot.get_content(resp)
+                content = bot.get_content(resp)
+                if content:
+                    return content.rstrip(self.prompter.stop_sequence)
+                return None
+            except ChatBotException:
+                # Deterministic error (bad request, auth failure, etc.) -- no point retrying.
+                raise
+            except Exception as e:
+                logger.warning(f"Failed to generate context using {label}: {e}")
+                return None
+
+        # First attempt.
+        context = _try_generate(self.chatbot, str(self.chatbot_model))
+
+        context_pool: list[str] = [context] if context else []
+        if not context or not self._validate_context(context):
+            validated = False
+
+            # Try retry_chatbot if available.
+            if self.retry_chatbot:
+                logger.info(f"Failed to validate the context using {self.chatbot}, retrying with {self.retry_chatbot}")
+                try:
+                    context = _try_generate(self.retry_chatbot, str(self.retry_chatbot))
+                except ChatBotException as e:
+                    logger.warning(f"Retry chatbot also failed with deterministic error: {e}")
+                    context = None
                 if context:
                     context_pool.append(context)
                 if context and self._validate_context(context):
@@ -373,15 +441,11 @@ class ContextReviewerAgent(Agent):
                 else:
                     logger.warning(f"Failed to validate the context using {self.retry_chatbot}: {context}")
 
+            # Retry with main chatbot on format failures.
             if not validated:
                 for i in range(2, 4):
                     logger.warning(f"Retry to generate the context using {self.chatbot} at {i} retries.")
-                    resp = self.chatbot.message(
-                        messages_list,
-                        stop_sequences=[self.prompter.stop_sequence],
-                        output_checker=self.prompter.check_format,
-                    )[0]
-                    context = self.chatbot.get_content(resp)
+                    context = _try_generate(self.chatbot, str(self.chatbot_model))
                     if context:
                         context_pool.append(context)
                     if context and self._validate_context(context):
@@ -393,15 +457,164 @@ class ContextReviewerAgent(Agent):
                     f"Finally failed to validate the context: {context}, you may check the context manually."
                 )
                 context = max(context_pool, key=len) if context_pool else ""
-                logger.info(f"Now using the longest context: {context}")
+                logger.debug(f"Now using the longest context: {context}")
 
         if not context:
             context = ""
 
-        if forced_glossary and glossary:
-            context = self.add_external_glossary(context, glossary)
-
         return context
+
+    @staticmethod
+    def _split_texts_by_tokens(texts: list[str], max_text_tokens: int) -> list[list[str]]:
+        """Split texts into chunks where each chunk's total tokens does not exceed max_text_tokens."""
+        chunks: list[list[str]] = []
+        current_chunk: list[str] = []
+        current_tokens = 0
+
+        for line in texts:
+            line_tokens = get_text_token_number(line)
+            if current_tokens + line_tokens > max_text_tokens and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(line)
+            current_tokens += line_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def _build_context_chunked(self, texts: list[str], title: str, glossary: dict | None) -> str:
+        """Generate guideline by splitting texts into chunks, generating partial guidelines, then merging."""
+        # Calculate max text tokens per chunk: context_window - system - user_overhead - output_reserve.
+        system_tokens = get_text_token_number(self.prompter.system())
+        user_overhead = get_text_token_number(self.prompter.user("", title=title, given_glossary=glossary))
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
+        max_text_tokens = int(context_window * 0.90) - system_tokens - user_overhead - self.MIN_OUTPUT_TOKENS
+
+        if max_text_tokens < self.MIN_CHUNK_TEXT_TOKENS:
+            logger.warning(
+                "Context window too small even for chunked generation. "
+                "Consider using a model with a larger context window."
+            )
+            return ""
+
+        chunks = self._split_texts_by_tokens(texts, max_text_tokens)
+        logger.info(f"Split into {len(chunks)} chunks for guideline generation.")
+
+        # Generate partial guidelines.
+        partial_guidelines: list[str] = []
+        for i, chunk in enumerate(chunks):
+            chunk_text = "\n".join(chunk)
+            messages = [
+                {"role": "system", "content": self.prompter.system()},
+                {
+                    "role": "user",
+                    "content": self.prompter.user_partial(
+                        chunk_text, chunk_index=i + 1, total_chunks=len(chunks), title=title, given_glossary=glossary
+                    ),
+                },
+            ]
+            try:
+                resp = self.chatbot.message(
+                    messages,
+                    stop_sequences=[self.prompter.stop_sequence],
+                    output_checker=self.prompter.check_format,
+                    temperature=self.TEMPERATURE,
+                )[0]
+                content = self.chatbot.get_content(resp)
+                if content:
+                    partial_guidelines.append(content.rstrip(self.prompter.stop_sequence))
+                    logger.info(f"Generated partial guideline {i + 1}/{len(chunks)}.")
+            except Exception as e:
+                logger.warning(f"Failed to generate partial guideline for chunk {i + 1}: {e}")
+
+        if not partial_guidelines:
+            return ""
+
+        # Single chunk succeeded: use it directly.
+        if len(partial_guidelines) == 1:
+            context = partial_guidelines[0]
+        else:
+            context = self._merge_guidelines(partial_guidelines, title)
+
+        # Final validation.
+        if not self._validate_context(context):
+            logger.warning("Chunked guideline failed validation, using best available result.")
+
+        return context or ""
+
+    def _merge_guidelines(self, guidelines: list[str], title: str) -> str:
+        """Merge multiple partial guidelines, using hierarchical merging if needed.
+
+        Estimates whether all guidelines fit in a single merge call. If not,
+        groups them into pairs, merges each pair, and recurses until one remains.
+        """
+        merge_system_tokens = get_text_token_number(self.prompter.merge_system())
+        mc = getattr(self.chatbot, 'model_config', None)
+        context_window = mc.context_window if (mc and mc.context_window) else 131072
+        max_merge_input = int(context_window * 0.90) - merge_system_tokens - self.MIN_OUTPUT_TOKENS
+
+        user_content = self.prompter.merge_user(guidelines, title=title)
+        user_tokens = get_text_token_number(user_content)
+
+        if user_tokens <= max_merge_input:
+            # All guidelines fit in one merge call.
+            return self._merge_call(guidelines, title)
+
+        # Too large: split into pairs and merge hierarchically.
+        logger.info(
+            f"Merge input too large ({user_tokens} tokens), merging hierarchically ({len(guidelines)} guidelines)."
+        )
+        merged: list[str] = []
+        for i in range(0, len(guidelines), 2):
+            pair = guidelines[i : i + 2]
+            if len(pair) == 1:
+                merged.append(pair[0])
+            else:
+                result = self._merge_call(pair, title)
+                merged.append(result)
+
+        if len(merged) == 1:
+            return merged[0]
+
+        # Recurse until one guideline remains.
+        return self._merge_guidelines(merged, title)
+
+    def _merge_call(self, guidelines: list[str], title: str) -> str:
+        """Execute a single merge LLM call with retries. Raises on failure."""
+        merge_messages = [
+            {"role": "system", "content": self.prompter.merge_system()},
+            {"role": "user", "content": self.prompter.merge_user(guidelines, title=title)},
+        ]
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.MERGE_RETRIES + 1):
+            try:
+                resp = self.chatbot.message(
+                    merge_messages,
+                    stop_sequences=[self.prompter.stop_sequence],
+                    output_checker=self.prompter.check_format,
+                    temperature=self.TEMPERATURE,
+                )[0]
+                content = self.chatbot.get_content(resp)
+                if content:
+                    content = content.rstrip(self.prompter.stop_sequence)
+                    if self._validate_context(content):
+                        return content
+                    logger.warning(f"Merge attempt {attempt}: output failed validation, retrying.")
+                else:
+                    logger.warning(f"Merge attempt {attempt}: empty response, retrying.")
+            except Exception as e:
+                logger.warning(f"Merge attempt {attempt} failed: {e}")
+                last_error = e
+
+        raise RuntimeError(
+            f"Failed to merge {len(guidelines)} partial guidelines after {self.MERGE_RETRIES} attempts. "
+            f"Consider using a model with a larger context window to avoid chunked generation."
+        ) from last_error
 
     def add_external_glossary(self, context, glossary: dict) -> str:
         """
@@ -428,27 +641,15 @@ class ProofreaderAgent(Agent):
 
     TEMPERATURE = 0.8
 
-    def __init__(
-        self,
-        src_lang,
-        target_lang,
-        info: TranslateInfo | None = None,
-        chatbot_model: str | ModelConfig = "gpt-4.1-nano",
-        fee_limit: float = 0.8,
-        proxy: str | None = None,
-        base_url_config: dict | None = None,
-    ):
+    def __init__(self, src_lang: str, target_lang: str, info: TranslateInfo | None = None, *, chatbot: ChatBot):
         """
         Initialize the ProofreaderAgent.
 
         Args:
-            src_lang (str): The source language.
-            target_lang (str): The target language.
-            info (TranslateInfo): Additional translation information.
-            chatbot_model (Union[str, ModelConfig]): The name or ModelConfig of the chatbot model to use.
-            fee_limit (float): The maximum fee allowed for API calls.
-            proxy (str): Proxy server to use for API calls.
-            base_url_config (Optional[dict]): Configuration for the base URL of the API.
+            src_lang: The source language.
+            target_lang: The target language.
+            info: Additional translation information.
+            chatbot: ChatBot instance to use for LLM calls.
         """
         super().__init__()
         if info is None:
@@ -457,7 +658,7 @@ class ProofreaderAgent(Agent):
         self.target_lang = target_lang
         self.info = info
         self.prompter = ProofreaderPrompter(src_lang, target_lang)
-        self.chatbot = self._initialize_chatbot(chatbot_model, fee_limit, proxy, base_url_config)
+        self.chatbot = chatbot
 
     def _parse_responses(self, resp) -> list[str]:
         """
@@ -493,7 +694,9 @@ class ProofreaderAgent(Agent):
             {"role": "system", "content": self.prompter.system()},
             {"role": "user", "content": self.prompter.user(texts, translations, context.guideline or "")},
         ]
-        resp = self.chatbot.message(messages_list, output_checker=self.prompter.check_format)[0]
+        resp = self.chatbot.message(
+            messages_list, output_checker=self.prompter.check_format, temperature=self.TEMPERATURE
+        )[0]
         revised = self._parse_responses(resp)
         return revised
 
@@ -511,24 +714,15 @@ class TranslationEvaluatorAgent(Agent):
 
     TEMPERATURE = 0.95
 
-    def __init__(
-        self,
-        chatbot_model: str | ModelConfig = "gpt-4.1-nano",
-        fee_limit: float = 0.8,
-        proxy: str | None = None,
-        base_url_config: dict | None = None,
-    ):
+    def __init__(self, *, chatbot: ChatBot):
         """
         Initialize the TranslationEvaluatorAgent.
 
         Args:
-            chatbot_model (Union[str, ModelConfig]): The name of the chatbot model or ModelConfig.
-            fee_limit (float): The maximum fee allowed for API calls.
-            proxy (str): Proxy server to use for API calls.
-            base_url_config (Optional[dict]): Configuration for the base URL of the API.
+            chatbot: ChatBot instance to use for LLM calls.
         """
         super().__init__()
-        self.chatbot = self._initialize_chatbot(chatbot_model, fee_limit, proxy, base_url_config)
+        self.chatbot = chatbot
         self.prompter = TranslationEvaluatorPrompter()
 
     def evaluate(self, src_texts: list[str], target_texts: list[str]) -> dict:
@@ -554,7 +748,9 @@ class TranslationEvaluatorAgent(Agent):
             {"role": "system", "content": self.prompter.system()},
             {"role": "user", "content": self.prompter.user(src_texts, target_texts)},
         ]
-        resp = self.chatbot.message(messages_list, stop_sequences=[self.prompter.stop_sequence])[0]
+        resp = self.chatbot.message(
+            messages_list, stop_sequences=[self.prompter.stop_sequence], temperature=self.TEMPERATURE
+        )[0]
         content = self.chatbot.get_content(resp)
 
         # Repair potentially broken JSON

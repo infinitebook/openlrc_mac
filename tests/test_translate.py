@@ -1,74 +1,58 @@
 #  Copyright (C) 2026. Hao Zheng
 #  All rights reserved.
 
-import os
 import unittest
 from pathlib import Path
 
 import openai
 
-from openlrc.models import ModelConfig, ModelProvider
+from openlrc.agents import create_chatbot
+from openlrc.media_utils import get_similarity
 from openlrc.translate import LLMTranslator
-from openlrc.utils import get_similarity
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-
-test_models = [
-    ModelConfig(
-        provider=ModelProvider.OPENAI,
-        name="openai/gpt-5-nano",
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-    ),
-    ModelConfig(
-        provider=ModelProvider.OPENAI,
-        name="anthropic/claude-haiku-4.5",
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-    ),
-    ModelConfig(
-        provider=ModelProvider.OPENAI,
-        name="google/gemini-2.5-flash-lite",
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-    ),
-]
-LIVE_API = os.environ.get("OPENLRC_TEST_LIVE_API", "").lower() in ("1", "true", "yes")
+from tests.conftest import LIVE_API, TEST_LLM_API_KEY, TEST_MODELS
 
 
 @unittest.skipUnless(LIVE_API, "Requires OPENLRC_TEST_LIVE_API=1 and valid API keys")
 class TestLLMTranslator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not OPENROUTER_API_KEY:
-            raise unittest.SkipTest("OPENROUTER_API_KEY is required for LLM integration tests.")
+        if not TEST_LLM_API_KEY:
+            raise unittest.SkipTest("OPENLRC_TEST_LLM_API_KEY is required for LLM integration tests.")
 
     def tearDown(self) -> None:
         compare_path = Path("translate_intermediate.json")
         compare_path.unlink(missing_ok=True)
 
     def test_single_chunk_translation(self):
-        for chatbot_model in test_models:
+        for chatbot_model in TEST_MODELS.values():
             text = "Hello, how are you?"
-            translator = LLMTranslator(chatbot_model)
-            translation = translator.translate(text, "en", "es")[0]
+            chatbot = create_chatbot(chatbot_model)
+            try:
+                translator = LLMTranslator(chatbot=chatbot)
+                translation = translator.translate(text, "en", "es")[0]
+            finally:
+                chatbot.close()
 
             self.assertGreater(get_similarity(translation, "Hola, ¿cómo estás?"), 0.5)
 
     def test_multiple_chunk_translation(self):
-        for chatbot_model in test_models:
+        for chatbot_model in TEST_MODELS.values():
             texts = ["Hello, how are you?", "I am fine, thank you."]
-            translator = LLMTranslator(chatbot_model)
-            translations = translator.translate(texts, "en", "es")
+            chatbot = create_chatbot(chatbot_model)
+            try:
+                translator = LLMTranslator(chatbot=chatbot)
+                translations = translator.translate(texts, "en", "es")
+            finally:
+                chatbot.close()
             self.assertGreater(get_similarity(translations[0], "Hola, ¿cómo estás?"), 0.5)
             self.assertGreater(get_similarity(translations[1], "Estoy bien, gracias."), 0.5)
 
     def test_different_language_translation(self):
-        for chatbot_model in test_models:
+        for chatbot_model in TEST_MODELS.values():
             text = "Hello, how are you?"
-            translator = LLMTranslator(chatbot_model)
+            chatbot = create_chatbot(chatbot_model)
             try:
+                translator = LLMTranslator(chatbot=chatbot)
                 translation = translator.translate(text, "en", "ja")[0]
                 self.assertTrue(
                     get_similarity(translation, "こんにちは、お元気ですか？") > 0.5
@@ -78,19 +62,29 @@ class TestLLMTranslator(unittest.TestCase):
                 pass
             except AssertionError:
                 print(f"Translation failed: {text} -> {translation}")
+            finally:
+                chatbot.close()
 
     def test_empty_text_list_translation(self):
-        for chatbot_model in test_models:
+        for chatbot_model in TEST_MODELS.values():
             texts = []
-            translator = LLMTranslator(chatbot_model)
-            translations = translator.translate(texts, "en", "es")
+            chatbot = create_chatbot(chatbot_model)
+            try:
+                translator = LLMTranslator(chatbot=chatbot)
+                translations = translator.translate(texts, "en", "es")
+            finally:
+                chatbot.close()
             self.assertEqual(translations, [])
 
     def test_atomic_translate(self):
-        for chatbot_model in test_models:
+        for chatbot_model in TEST_MODELS.values():
             texts = ["Hello, how are you?", "I am fine, thank you."]
-            translator = LLMTranslator(chatbot_model)
-            translations = translator.atomic_translate(chatbot_model, texts, "en", "zh")
+            chatbot = create_chatbot(chatbot_model)
+            try:
+                translator = LLMTranslator(chatbot=chatbot)
+                translations = translator.atomic_translate(chatbot, texts, "en", "zh")
+            finally:
+                chatbot.close()
             self.assertGreater(get_similarity(translations[0], "你好，你好吗？"), 0.5)
             self.assertGreater(get_similarity(translations[1], "我很好，谢谢。"), 0.5)
 

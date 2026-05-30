@@ -12,6 +12,7 @@ from openlrc.validators import (
     BaseValidator,
     ChunkedTranslateValidator,
     ContextReviewerValidateValidator,
+    LeanTranslateValidator,
     ProofreaderValidator,
     TranslationEvaluatorValidator,
 )
@@ -196,7 +197,124 @@ class AtomicTranslatePrompter(TranslatePrompter):
 Please do not output any content other than the translated text. Here is the text: {text}"""
 
 
-class ContextReviewPrompter(Prompter):
+LEAN_TRANSLATE_INSTRUCTION = """You are a subtitle translator. Translate each numbered line from {src_lang} to {target_lang}.
+
+Rules:
+- Output ONLY the translation for each line, prefixed with its line number.
+- Preserve the original line numbering exactly.
+- Do not merge or split lines.
+- Do not add explanations, notes, or commentary.
+- Maintain natural, colloquial style suitable for subtitles.
+- Use the provided context to ensure consistency.
+
+Output format (one block per line):
+#<id>
+<translation>
+
+Example:
+#200
+在变化的时代中，
+#501
+生存的秘诀是不断进化。
+"""
+
+LEAN_RETRY_INSTRUCTION = """Previous response had formatting issues. \
+Please ensure each translated line starts with #<id> on its own line, \
+followed by the translation on the next line. Do not add any extra text."""
+
+
+class LeanTranslatePrompter(TranslatePrompter):
+    """Prompter for :class:`LeanTranslator`.
+
+    Produces a compact system prompt (~150 tokens) and a user prompt that
+    carries three layers of fixed-budget context: global summary, terminology
+    map, and a sliding window of recent translation pairs.
+    """
+
+    def __init__(self, src_lang: str, target_lang: str):
+        self.src_lang = src_lang
+        self.target_lang = target_lang
+        self.src_lang_display, self.target_lang_display = self.get_language_display_names(src_lang, target_lang)
+        # Validator is set per-chunk via update_expected_ids() before each call.
+        self.validator: LeanTranslateValidator | None = None
+
+    def update_expected_ids(self, expected_ids: list[int]) -> None:
+        """Refresh the validator with the line IDs of the current chunk."""
+        self.validator = LeanTranslateValidator(expected_ids)
+
+    def system(self) -> str:
+        return LEAN_TRANSLATE_INSTRUCTION.format(
+            src_lang=self.src_lang_display,
+            target_lang=self.target_lang_display,
+        )
+
+    def user(
+        self,
+        user_input: str,
+        *,
+        summary: str = "",
+        characters: str = "",
+        terminology: str = "",
+        sliding_window: str = "",
+    ) -> str:
+        context_parts: list[str] = []
+        if summary:
+            context_parts.append(f"Summary: {summary}")
+        if characters:
+            context_parts.append(f"Characters:\n{characters}")
+        if terminology:
+            context_parts.append(f"Terminology:\n{terminology}")
+        if sliding_window:
+            context_parts.append(f"Recent translations:\n{sliding_window}")
+
+        sections: list[str] = []
+        if context_parts:
+            sections.append("[Context]\n" + "\n\n".join(context_parts))
+        sections.append(
+            f"Please translate the following subtitles"
+            f" from {self.src_lang_display} to {self.target_lang_display}:\n\n"
+            f"{user_input}"
+        )
+        return "\n\n".join(sections)
+
+    @classmethod
+    def format_texts(cls, texts: list[tuple[int, str]]) -> str:  # type: ignore[override]
+        """Format chunk lines as ``#id\\ntext`` blocks (no Original>/Translation> prefixes)."""
+        return "\n".join(f"#{line_id}\n{text}" for line_id, text in texts)
+
+
+class ContextReviewPrompterBase(Prompter, ABC):
+    """Interface contract for prompters used by :class:`ContextReviewerAgent`.
+
+    Subclasses must implement all abstract methods.  ``ContextReviewerAgent``
+    relies on this interface for single-pass generation, chunked generation,
+    and guideline merging.
+    """
+
+    expected_sections: list[str]
+    stop_sequence: str
+
+    @abc.abstractmethod
+    def system(self) -> str: ...
+
+    @abc.abstractmethod
+    def user(self, text: str, title: str = "", given_glossary: dict | None = None) -> str: ...
+
+    @abc.abstractmethod
+    def user_partial(
+        self, text: str, chunk_index: int, total_chunks: int, title: str = "", given_glossary: dict | None = None
+    ) -> str: ...
+
+    @abc.abstractmethod
+    def merge_system(self) -> str: ...
+
+    @abc.abstractmethod
+    def merge_user(self, partial_guidelines: list[str], title: str = "") -> str: ...
+
+
+class ContextReviewPrompter(ContextReviewPrompterBase):
+    expected_sections = ["glossary", "characters", "summary", "tone and style", "target audience"]
+
     def __init__(self, src_lang, target_lang):
         self.src_lang = src_lang
         self.target_lang = target_lang
@@ -278,6 +396,179 @@ Please review the following text (title:{title}) and provide the necessary conte
 {text}
 
 Now, generate Glossary, Characters, Summary, Tone and Style, and Target Audience:
+"""
+
+    def user_partial(self, text, chunk_index: int, total_chunks: int, title="", given_glossary: dict | None = None):
+        glossary_text = f"Given glossary: {given_glossary}" if given_glossary else ""
+        return f"""{glossary_text}
+The following is section {chunk_index} of {total_chunks} from the subtitle file (title:{title}).
+Note: This is only a portion of the full content. Focus on the terms, characters, and events present in this section.
+
+Please review the following text and provide the necessary context for the translation from {self.src_lang_display} to {self.target_lang_display}:
+{text}
+
+Now, generate Glossary, Characters, Summary, Tone and Style, and Target Audience for this section:
+"""
+
+    def merge_system(self):
+        return f"""You are a context reviewer. You will receive multiple partial translation guidelines \
+generated from different sections of the same subtitle file ({self.src_lang_display} to {self.target_lang_display}). \
+Merge them into a single comprehensive guideline following these rules:
+
+Merge rules:
+- Glossary: Union of all entries. If the same term appears with different translations, keep the more specific one.
+- Characters: Union of all characters. Merge descriptions for the same character across sections.
+- Summary: Synthesize a coherent summary covering all sections in chronological order.
+- Tone and Style: Use the most representative description. If sections differ, note the variation.
+- Target Audience: Use the most comprehensive description.
+
+The final output must contain exactly these sections: Glossary, Characters, Summary, Tone and Style, Target Audience. \
+DO NOT include any other sections.
+
+<example>
+Example Input:
+### Partial guideline 1:
+### Glossary:
+- suspect: 嫌疑人
+### Characters:
+- John: 约翰, a detective
+### Summary:
+John begins investigating a case.
+### Tone and Style:
+Formal and professional.
+### Target Audience:
+Adult viewers interested in crime dramas.
+
+---
+
+### Partial guideline 2:
+### Glossary:
+- uptown: 市中心
+- suspect: 嫌犯
+### Characters:
+- John: 约翰, a detective with 10 years of experience
+- Sarah: 萨拉, John's partner
+### Summary:
+Sarah joins John and they plan to search the uptown area.
+### Tone and Style:
+Formal and serious.
+### Target Audience:
+Adult viewers who enjoy police procedurals.
+
+Example Output:
+### Glossary:
+- suspect: 嫌疑人
+- uptown: 市中心
+### Characters:
+- John: 约翰, a detective with 10 years of experience
+- Sarah: 萨拉, John's partner
+### Summary:
+John begins investigating a case. Sarah joins him and they plan to search the uptown area for the suspect.
+### Tone and Style:
+Formal, professional, and serious, reflecting the nature of the investigation.
+### Target Audience:
+Adult viewers interested in crime dramas and police procedurals.
+{self.stop_sequence}
+</example>
+
+Remember to add {self.stop_sequence} after the generated contexts."""
+
+    def merge_user(self, partial_guidelines: list[str], title: str = ""):
+        parts = "\n\n---\n\n".join(f"### Partial guideline {i + 1}:\n{g}" for i, g in enumerate(partial_guidelines))
+        return f"""Title: {title}
+
+{parts}
+
+Now, merge the above into one comprehensive guideline with Glossary, Characters, Summary, Tone and Style, and Target Audience:
+"""
+
+
+class LeanContextReviewPrompter(ContextReviewPrompterBase):
+    """Compact CR prompter for :class:`LeanTranslator`.
+
+    Requests only Glossary, Characters, and Summary in YAML-like format.
+    """
+
+    expected_sections = ["glossary", "characters", "summary"]
+
+    def __init__(self, src_lang: str, target_lang: str):
+        self.src_lang = src_lang
+        self.target_lang = target_lang
+        self.src_lang_display, self.target_lang_display = TranslatePrompter.get_language_display_names(
+            src_lang, target_lang
+        )
+        self.stop_sequence = "<--END-OF-CONTEXT-->"
+
+    def system(self) -> str:
+        return f"""You are a context reviewer for subtitle translation from {self.src_lang_display} to {self.target_lang_display}.
+
+Generate exactly three sections in YAML format:
+
+glossary:
+  - <source term>: <translated term>
+characters:
+  - <name>: <translated name>, <brief description>
+summary: <one-paragraph plot summary>
+
+Rules:
+- Glossary: key terms, slang, and culturally specific references that need consistent translation.
+- Characters: name translations with relationships or roles.
+- Summary: concise plot summary to help translators understand context.
+- Do NOT include any other sections.
+- Do NOT include translations of the source text.
+- End your response with {self.stop_sequence}
+
+Example output:
+glossary:
+  - suspect: 嫌疑人
+  - uptown: 市中心
+characters:
+  - John: 约翰, a detective with 10 years of experience
+  - Sarah: 萨拉, John's partner
+summary: John and Sarah discuss their plan to locate a suspect in the uptown area.
+{self.stop_sequence}"""
+
+    def user(self, text: str, title: str = "", given_glossary: dict | None = None) -> str:
+        glossary_text = f"Given glossary: {given_glossary}\n" if given_glossary else ""
+        return f"""{glossary_text}\
+Please review the following text (title: {title}) and provide context for translation from {self.src_lang_display} to {self.target_lang_display}:
+{text}
+
+Now, generate glossary, characters, and summary:
+"""
+
+    def user_partial(
+        self, text: str, chunk_index: int, total_chunks: int, title: str = "", given_glossary: dict | None = None
+    ) -> str:
+        glossary_text = f"Given glossary: {given_glossary}\n" if given_glossary else ""
+        return f"""{glossary_text}\
+Section {chunk_index} of {total_chunks} from subtitle file (title: {title}).
+
+Please review and provide context for translation from {self.src_lang_display} to {self.target_lang_display}:
+{text}
+
+Now, generate glossary, characters, and summary for this section:
+"""
+
+    def merge_system(self) -> str:
+        return f"""You are a context reviewer. Merge multiple partial guidelines \
+({self.src_lang_display} to {self.target_lang_display}) into one using YAML format.
+
+Merge rules:
+- glossary: Union of all entries. Keep the more specific translation for duplicates.
+- characters: Union of all characters. Merge descriptions for the same character.
+- summary: Synthesize a coherent summary covering all sections chronologically.
+
+Output exactly three sections: glossary, characters, summary.
+End with {self.stop_sequence}"""
+
+    def merge_user(self, partial_guidelines: list[str], title: str = "") -> str:
+        parts = "\n\n---\n\n".join(f"Partial guideline {i + 1}:\n{g}" for i, g in enumerate(partial_guidelines))
+        return f"""Title: {title}
+
+{parts}
+
+Now, merge into one guideline with glossary, characters, and summary:
 """
 
 
