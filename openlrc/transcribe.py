@@ -13,6 +13,7 @@ from openlrc.logger import logger
 from openlrc.media_utils import get_audio_duration, spacy_load
 from openlrc.utils import Timer, format_timestamp
 from openlrc.whisper_backend import WhisperCLIBackend
+from openlrc.whisper_resources import DEFAULT_MODEL_NAME, DEFAULT_VAD_MODEL_NAME
 from openlrc.whisper_types import Segment, Word
 
 
@@ -183,9 +184,9 @@ class Transcriber:
 
     def __init__(
         self,
-        model_name: str = "ggml-large-v3-turbo.bin",
-        cli_path: str = "whisper-cli",
-        vad_model: str = "",
+        model_name: str = DEFAULT_MODEL_NAME,
+        cli_path: str = "",
+        vad_model: str = DEFAULT_VAD_MODEL_NAME,
         asr_options: dict | None = None,
         # 以下参数保留签名兼容性但不再使用
         compute_type: str = "float16",

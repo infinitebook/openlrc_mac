@@ -8,3 +8,6 @@ run.py
 __pycache__/
 uv.lock
 .DS_Store
+/vendor/whisper.cpp/build/
+/tests/data/test_nospeech_video.srt
+/tests/data/test_nospeech_video.wav

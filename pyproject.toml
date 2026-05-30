@@ -33,6 +33,7 @@ dependencies = [
     "filetype>=1.2.0,<2",
     "jaconvV2>=0.4,<0.5",
     "spacy>=3.8.5,<4",
+    "click>=8.1,<9",
     "pysbd>=0.3.4,<0.4",
     "ffmpeg-normalize>=1.27.5,<2",
     "google-genai>=1.70.0",

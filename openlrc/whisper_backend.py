@@ -14,35 +14,13 @@ import json
 import logging
 import queue
 import re
-import shutil
 import subprocess
 import threading
 from typing import Callable
 
+from openlrc.whisper_resources import resolve_vad_model_path, resolve_whisper_cli, resolve_whisper_model_path
+
 logger = logging.getLogger(__name__)
-
-
-def _find_cli(cli_path: str) -> str:
-    """校验 whisper-cli 可执行文件是否存在。
-
-    Args:
-        cli_path: whisper-cli 可执行文件路径或名称。
-
-    Returns:
-        解析后的可执行文件完整路径。
-
-    Raises:
-        FileNotFoundError: 找不到可执行文件。
-    """
-    resolved = shutil.which(cli_path)
-    if resolved is None:
-        raise FileNotFoundError(
-            f"whisper-cli not found at '{cli_path}'. "
-            "Install via: brew install whisper-cpp, "
-            "or build from source with Metal support, "
-            "or set cli_path to the full path of the whisper-cli executable."
-        )
-    return resolved
 
 
 class WhisperCLIBackend:
@@ -60,9 +38,9 @@ class WhisperCLIBackend:
     """
 
     def __init__(self, cli_path: str, model_path: str, vad_model_path: str = ""):
-        self.cli_path = _find_cli(cli_path)
-        self.model_path = model_path
-        self.vad_model_path = vad_model_path
+        self.cli_path = resolve_whisper_cli(cli_path)
+        self.model_path = resolve_whisper_model_path(model_path)
+        self.vad_model_path = resolve_vad_model_path(vad_model_path) if vad_model_path else ""
 
     def transcribe(
         self,

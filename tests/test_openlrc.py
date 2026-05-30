@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from openlrc.whisper_resources import DEFAULT_MODEL_NAME
 from openlrc.whisper_types import Segment, Word
 
 from openlrc.openlrc import LRCer, TranscriptionConfig, TranslationConfig
@@ -17,7 +18,7 @@ TEST_DATA_DIR = Path(__file__).parent / "data"
 
 # Shared test config — avoids repeating these in every test method.
 _TEST_TRANSCRIPTION = TranscriptionConfig(
-    whisper_model="tiny", cli_path=sys.executable, compute_type="default", device="cpu"
+    whisper_model=sys.executable, cli_path=sys.executable, vad_model="", compute_type="default", device="cpu"
 )
 
 
@@ -285,6 +286,6 @@ class TestLRCer(unittest.TestCase):
     def test_default_construction_without_arguments(self, _mock_chatbot):
         """LRCer() with no arguments should use default configs."""
         lrcer = LRCer()
-        self.assertEqual(lrcer._transcription_config.whisper_model, "whisper.cpp/models/ggml-base.bin")
+        self.assertEqual(lrcer._transcription_config.whisper_model, DEFAULT_MODEL_NAME)
         self.assertIsNone(lrcer._translation_config.chatbot)
         self.assertIsNone(lrcer._transcriber)

@@ -22,27 +22,49 @@ into `.lrc` subtitles with LLMs such as
 
 1. Install [ffmpeg](https://ffmpeg.org/download.html) and make sure it is on your `PATH`.
 
-2. Install or build `whisper-cli` from [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
-   On macOS, a Homebrew install is usually enough:
+2. Prepare the vendored [whisper.cpp](https://github.com/ggml-org/whisper.cpp) submodule.
+   This repository pins `whisper.cpp` under `vendor/whisper.cpp`, so everyone builds from the
+   same upstream commit:
 
     ```shell
-    brew install whisper-cpp
+    git submodule update --init --recursive
+    uv run python scripts/setup_whisper_cpp.py
     ```
 
-   This fork's default `TranscriptionConfig` points at `whisper.cpp/build/bin/whisper-cli` and
-   `whisper.cpp/models/ggml-base.bin`. If you use Homebrew or keep models elsewhere, pass explicit paths:
+   The setup script builds `vendor/whisper.cpp/build/bin/whisper-cli` in CMake Release mode and
+   downloads these default models into `~/Library/Application Support/OpenLRC/models/`:
+
+   - `ggml-base.bin`
+   - `ggml-silero-v6.2.0.bin`
+
+   Runtime resolution uses the same code path in development, CI, and future macOS app packaging:
+
+   - CLI: `TranscriptionConfig.cli_path`, `OPENLRC_WHISPER_CLI`, bundled app resource,
+     `vendor/whisper.cpp/build/bin/whisper-cli`, then `PATH`.
+   - Models: `TranscriptionConfig.whisper_model` / `TranscriptionConfig.vad_model`, the matching
+     `OPENLRC_WHISPER_MODEL` / `OPENLRC_WHISPER_VAD_MODEL`, `OPENLRC_WHISPER_MODEL_DIR`, then
+     `vendor/whisper.cpp/models/`.
+
+   Defaults are semantic names, so a normal `LRCer()` uses `ggml-base.bin`, `ggml-silero-v6.2.0.bin`,
+   and an auto-resolved `whisper-cli`. If you keep binaries or models elsewhere, pass explicit paths
+   or set environment variables:
 
     ```python
     from openlrc import LRCer, TranscriptionConfig
 
     lrcer = LRCer(
         transcription=TranscriptionConfig(
-            cli_path="whisper-cli",
+            cli_path="/path/to/whisper-cli",
             whisper_model="/path/to/ggml-base.bin",
-            vad_model="",
+            vad_model="/path/to/ggml-silero-v6.2.0.bin",
         )
     )
     ```
+
+   To disable native VAD, set `vad_model=""`.
+
+   Future `.app` packaging can place `whisper-cli` in the app bundle resources; the resolver checks
+   that bundled binary before falling back to the development submodule build and `PATH`.
 
 3. Add LLM API keys (recommended for most users: `OPENROUTER_API_KEY`):
    - Add your [OpenAI API key](https://platform.openai.com/account/api-keys) to environment variable `OPENAI_API_KEY`.

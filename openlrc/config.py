@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 
 from openlrc.models import ModelConfig
+from openlrc.whisper_resources import DEFAULT_MODEL_NAME, DEFAULT_VAD_MODEL_NAME
 
 
 @dataclass
@@ -12,11 +13,12 @@ class TranscriptionConfig:
     Configuration for the transcription stage.
 
     Args:
-        whisper_model: Path to whisper GGML model file, or model name.
-            Default: ``large-v3``
-        cli_path: Path to the whisper-cli executable. Default: ``whisper-cli``
+        whisper_model: Path to whisper GGML model file, or semantic model filename.
+            Default: ``ggml-base.bin``
+        cli_path: Path to the whisper-cli executable. Empty string resolves automatically.
+            Default: ``""``
         vad_model: Path to the Silero VAD model for whisper.cpp.
-            Empty string disables native VAD. Default: ``""``
+            Empty string disables native VAD. Default: ``ggml-silero-v6.2.0.bin``
         compute_type: Computation type (legacy, kept for compatibility).
             Default: ``float16``
         device: Device for computation (legacy, kept for compatibility).
@@ -26,9 +28,9 @@ class TranscriptionConfig:
         preprocess_options: Options for audio preprocessing.
     """
 
-    whisper_model: str = "whisper.cpp/models/ggml-base.bin"
-    cli_path: str = "whisper.cpp/build/bin/whisper-cli"
-    vad_model: str = "whisper.cpp/models/ggml-silero-v6.2.0.bin"
+    whisper_model: str = DEFAULT_MODEL_NAME
+    cli_path: str = ""
+    vad_model: str = DEFAULT_VAD_MODEL_NAME
     compute_type: str = "float16"
     device: str = "cuda"
     asr_options: dict | None = None

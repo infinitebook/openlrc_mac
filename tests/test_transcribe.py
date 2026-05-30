@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from openlrc.whisper_types import Segment, Word
+from openlrc.whisper_backend import WhisperCLIBackend
+from openlrc.whisper_resources import DEFAULT_MODEL_NAME, DEFAULT_VAD_MODEL_NAME
 from openlrc.transcribe import Transcriber, TranscriptionInfo, map_cli_json_to_segments, _parse_timestamp_str
 
 
@@ -48,6 +50,16 @@ class TestTranscriber(unittest.TestCase):
         self.audio_path = Path(__file__).parent / "data" / "test_audio.wav"
 
     @patch("openlrc.transcribe.WhisperCLIBackend")
+    def test_init_uses_semantic_resource_defaults(self, MockBackend):
+        """Transcriber should pass semantic defaults into the backend resolver path."""
+        Transcriber()
+        MockBackend.assert_called_once_with(
+            cli_path="",
+            model_path=DEFAULT_MODEL_NAME,
+            vad_model_path=DEFAULT_VAD_MODEL_NAME,
+        )
+
+    @patch("openlrc.transcribe.WhisperCLIBackend")
     def test_transcribe_success(self, MockBackend):
         """Test that transcribe() returns valid segments and info."""
         mock_backend_instance = MockBackend.return_value
@@ -77,6 +89,21 @@ class TestTranscriber(unittest.TestCase):
         transcriber = Transcriber(model_name="tiny", cli_path="whisper-cli")
         with self.assertRaises(FileNotFoundError):
             transcriber.transcribe("audio.wav")
+
+
+class TestWhisperCLIBackend(unittest.TestCase):
+    @patch("openlrc.whisper_backend.resolve_vad_model_path", return_value="/tmp/vad.bin")
+    @patch("openlrc.whisper_backend.resolve_whisper_model_path", return_value="/tmp/model.bin")
+    @patch("openlrc.whisper_backend.resolve_whisper_cli", return_value="/tmp/whisper-cli")
+    def test_backend_resolves_cli_and_models(self, mock_cli, mock_model, mock_vad):
+        backend = WhisperCLIBackend("", DEFAULT_MODEL_NAME, DEFAULT_VAD_MODEL_NAME)
+
+        mock_cli.assert_called_once_with("")
+        mock_model.assert_called_once_with(DEFAULT_MODEL_NAME)
+        mock_vad.assert_called_once_with(DEFAULT_VAD_MODEL_NAME)
+        self.assertEqual(backend.cli_path, "/tmp/whisper-cli")
+        self.assertEqual(backend.model_path, "/tmp/model.bin")
+        self.assertEqual(backend.vad_model_path, "/tmp/vad.bin")
 
 
 class TestMapCliJsonToSegments(unittest.TestCase):
