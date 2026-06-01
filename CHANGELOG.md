@@ -1,3 +1,55 @@
+# Changelog
+
+## OpenLRC Mac 0.1.0
+
+Initial macOS-focused fork release based on upstream OpenLRC `1.7.0a1`.
+
+### Added
+
+- Integrated `whisper.cpp` as a Git submodule under `vendor/whisper.cpp`.
+- Added `scripts/setup_whisper_cpp.py` to initialize the submodule, build
+  `whisper-cli` in CMake Release mode, and download default GGML models.
+- Added `openlrc/whisper_resources.py` to resolve `whisper-cli`, Whisper models,
+  and VAD models through one shared runtime path.
+- Added support for semantic Whisper model names such as `base`, `small`,
+  `medium`, and `large-v3-turbo`.
+- Added environment variable overrides for local development and future macOS
+  app packaging:
+  - `OPENLRC_WHISPER_CLI`
+  - `OPENLRC_WHISPER_MODEL`
+  - `OPENLRC_WHISPER_VAD_MODEL`
+  - `OPENLRC_WHISPER_MODEL_DIR`
+
+### Changed
+
+- Replaced the old default transcription path with local `whisper.cpp` CLI
+  transcription.
+- Updated `TranscriptionConfig` defaults to semantic local resources:
+  - `cli_path=""`
+  - `whisper_model="ggml-base.bin"`
+  - `vad_model="ggml-silero-v6.2.0.bin"`
+- Rewrote the README around this fork's macOS, `whisper.cpp`, and future GUI
+  direction.
+- Added `click` as an explicit dependency because the real transcription flow
+  imports SpaCy's CLI path during language model setup.
+
+### Verified
+
+- Built `vendor/whisper.cpp/build/bin/whisper-cli` successfully on macOS with
+  Metal backend enabled.
+- Downloaded and resolved `ggml-base.bin` and `ggml-silero-v6.2.0.bin` from
+  `~/Library/Application Support/OpenLRC/models/`.
+- Verified real local transcription through `WhisperCLIBackend`,
+  `Transcriber`, and `LRCer().transcribe(...)`.
+- Verified the full pytest suite: `194 passed, 25 skipped`.
+
+---
+
+## Upstream OpenLRC Changelog
+
+The entries below are inherited from [zh-plus/openlrc](https://github.com/zh-plus/openlrc)
+and predate this macOS fork.
+
 ## 1.7.0a1
 
 Add a token-efficient lean translation pipeline, broaden model-provider routing, and refresh the configuration surface for mixed-model workflows.
