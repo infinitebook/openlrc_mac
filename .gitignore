@@ -2,6 +2,7 @@
 .idea
 .env
 run.py
+test_run.py
 /data/
 /dist/
 /openfaker.egg-info/
